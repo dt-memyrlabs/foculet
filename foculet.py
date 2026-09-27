@@ -226,6 +226,43 @@ def is_owned(hwnd):
         return False
 
 
+# hosts of transient shell UI: tray overflow, Start menu, search,
+# notification center, quick settings...
+_SHELL_HOSTS = {"explorer.exe", "startmenuexperiencehost.exe",
+                "searchhost.exe", "shellexperiencehost.exe"}
+
+
+def _class_name(hwnd):
+    buf = ctypes.create_unicode_buffer(256)
+    try:
+        if ctypes.windll.user32.GetClassNameW(hwnd, buf, 256):
+            return buf.value
+    except Exception:
+        pass
+    return ""
+
+
+def is_shell_transient(hwnd):
+    """True for transient shell UI (tray overflow flyout, Start menu,
+    volume/network flyouts). Never a real switch, never parked.
+
+    Explorer *file* windows (CabinetWClass) are real windows and are
+    left alone by this check."""
+    try:
+        ex = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
+        if ex & win32con.WS_EX_TOOLWINDOW:
+            return True
+    except Exception:
+        pass
+    try:
+        if exe_of(hwnd) in _SHELL_HOSTS \
+                and _class_name(hwnd) != "CabinetWClass":
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def age_badge(age_s):
     """(label, color) showing how long a window has been parked."""
     m = int(age_s // 60)
@@ -253,6 +290,8 @@ def parkable(hwnd, dump_device, excluded_exes):
             return False
         if is_owned(hwnd):                    # a dialog/popup: belongs to
             return False                      # its owner, never parked alone
+        if is_shell_transient(hwnd):          # tray overflow, Start menu,
+            return False                      # flyouts: not real windows
     except Exception:
         return False
     title = safe_title(hwnd)
@@ -772,9 +811,10 @@ class Foculet:
         # each screen remembers its current window; the moment you
         # focus a new window on a screen, that screen's previous
         # window gets its picture taken and is parked on the board.
-        if fg and is_owned(fg):
-            return  # a dialog/popup opened (file picker, save dialog):
-                    # not a real switch - leave the owner window alone
+        if fg and (is_owned(fg) or is_shell_transient(fg)):
+            return  # a dialog/popup opened (file picker, save dialog),
+                    # or transient shell UI (tray overflow, Start menu):
+                    # not a real switch - leave everything alone
         if fg in self.parked_keys():
             # A parked window became foreground. That can be a deliberate
             # restore (taskbar click, board is separate) - or just a
