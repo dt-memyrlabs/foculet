@@ -97,6 +97,10 @@ Delete `foculet.json` to re-run first-time setup.
 - **Dialogs and popups.** File pickers, save dialogs, dropdowns — anything
   *owned* by another window — never count as a switch and are never parked
   themselves. Opening a dialog leaves the window behind it exactly where it is.
+- **Transient shell UI.** The system tray overflow, Start menu, search,
+  notification center, and volume/network flyouts are invisible to the
+  watcher: opening them neither parks your current window nor parks
+  themselves. (Explorer *file* windows still park normally.)
 - **The dump monitor.** Windows already on the board's monitor are left alone.
 - **Excluded apps**, the Foculet console, and windows without titles.
 - **Board capacity.** When the grid is full, further parks are skipped
