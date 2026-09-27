@@ -226,6 +226,20 @@ def is_owned(hwnd):
         return False
 
 
+def age_badge(age_s):
+    """(label, color) showing how long a window has been parked."""
+    m = int(age_s // 60)
+    if m < 1:
+        return "<1m", "#888888"
+    txt = f"{m}m" if m < 60 else (f"{m // 60}h" if m < 1440
+                                  else f"{m // 1440}d")
+    if m < 15:
+        return txt, "#888888"   # fresh
+    if m < 60:
+        return txt, "#d99a2b"   # waiting a while
+    return txt, "#d95f2b"       # waiting long
+
+
 def parkable(hwnd, dump_device, excluded_exes):
     """True if this window is eligible to be parked right now."""
     if hwnd == OWN_CONSOLE:
@@ -594,7 +608,8 @@ class Foculet:
             cell.grid(row=i // self.grid_cols, column=i % self.grid_cols,
                       padx=6, pady=6, sticky="nsew")
             if i < len(items):
-                hwnd, title, thumb = items[i]
+                hwnd, title, thumb, parked_at = items[i]
+                age_txt, age_fg = age_badge(time.time() - parked_at)
                 photo = None
                 try:
                     if os.path.exists(thumb):
@@ -611,6 +626,10 @@ class Foculet:
                     pic.bind("<Button-1>", lambda e, h=hwnd: self.unpark(h))
                     pic.bind("<Button-3>",
                              lambda e, h=hwnd: self.close_parked(h))
+                # age badge: how long this window has been waiting
+                badge = tk.Label(cell, text=age_txt, fg=age_fg, bg="#101010",
+                                 font=("Segoe UI", 8), padx=4, pady=1)
+                badge.place(relx=1.0, rely=0.0, anchor="ne", x=-4, y=4)
                 name = (title[:34] + "…") if len(title) > 34 else title
                 tl = tk.Label(cell, text=name or "(no title)", fg="#bbbbbb",
                               bg="#1e1e1e", font=("Segoe UI", 9),
@@ -627,11 +646,13 @@ class Foculet:
         try:
             with self.lock:
                 # oldest parked first: the board reads like a timeline
+                now = time.time()
                 ordered = sorted(self.parked.items(),
                                  key=lambda kv: kv[1].get("parked_at", 0))
-                items = [(h, p["title"], p["thumb"])
+                items = [(h, p["title"], p["thumb"], p.get("parked_at", now))
                          for h, p in ordered if is_alive(h)]
-            key = tuple(h for h, _, _ in items)
+            # key includes the age minute-bucket so badges tick over
+            key = tuple((h, int((now - pa) // 60)) for h, _, _, pa in items)
             if key != self._lot_key:
                 if items:
                     self.root.deiconify()
