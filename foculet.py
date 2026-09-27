@@ -1,0 +1,908 @@
+#!/usr/bin/env python3
+"""
+Foculet - a Windows focus-parking app.
+
+The loop:
+  * every time you switch to a new window on a screen, that screen's
+    previous window is "parked": Foculet snaps a thumbnail picture of it,
+    minimizes the real window, and pins the picture to the board on
+    the dump monitor - a giant taskbar of pictures of what you were doing
+  * click a picture -> the real window restores to the monitor it came from
+  * right-click a picture -> the real window is closed
+  * close a parked window -> its picture vanishes from the board
+
+Usage:
+  py -3 foculet.py [--dump rightmost] [--config foculet.json]
+
+  --dump: rightmost | primary | <0-based index left-to-right> | <device name>
+"""
+
+import argparse
+import ctypes
+import json
+import os
+import sys
+import threading
+import time
+import traceback
+import tkinter as tk
+import urllib.request
+
+from PIL import Image, ImageTk, ImageDraw
+
+import win32api
+import win32con
+import win32gui
+import win32process
+import win32console
+import win32ui
+
+# PrintWindow is not wrapped by this pywin32 build - call it via ctypes.
+# PW_RENDERFULLCONTENT (2) asks the app to render its full content.
+_print_window = ctypes.windll.user32.PrintWindow
+_print_window.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint]
+_print_window.restype = ctypes.c_bool
+
+
+def print_window(hwnd, hdc):
+    for flag in (2, 0):
+        try:
+            if _print_window(hwnd, hdc, flag):
+                return True
+        except Exception:
+            pass
+    return False
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+LOG_PATH = os.path.join(HERE, "foculet.log")
+THUMB_DIR = os.path.join(HERE, "thumbs")
+
+POLL_SECS = 0.5
+GRID_COLS = 3            # default board grid; Daniel can change it in
+GRID_ROWS = 2            # foculet.json (grid_cols/grid_rows) or the setup picker
+THUMB_MAX = (560, 400)   # fallback; the real size is computed from the
+                         # dump monitor's work area and the grid
+
+OWN_CONSOLE = win32console.GetConsoleWindow()
+
+
+def log(msg):
+    line = f"[{time.strftime('%H:%M:%S')}] {msg}"
+    try:
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+    try:
+        if sys.stdout.isatty():
+            print(line, flush=True)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------- monitors
+
+def list_monitors():
+    mons = []
+    for hmon, _hdc, _rect in win32api.EnumDisplayMonitors():
+        info = win32api.GetMonitorInfo(hmon)
+        mons.append({
+            "handle": hmon,
+            "device": info["Device"],
+            "rect": info["Monitor"],   # (left, top, right, bottom)
+            "work": info["Work"],      # work area (excludes taskbar)
+            "primary": bool(info["Flags"] & win32con.MONITORINFOF_PRIMARY),
+        })
+    mons.sort(key=lambda m: m["rect"][0])  # left to right
+    return mons
+
+
+def monitor_from_rect(rect):
+    try:
+        hmon = win32api.MonitorFromRect(rect, win32con.MONITOR_DEFAULTTONEAREST)
+        info = win32api.GetMonitorInfo(hmon)
+        return {
+            "handle": hmon,
+            "device": info["Device"],
+            "rect": info["Monitor"],
+            "work": info["Work"],
+            "primary": bool(info["Flags"] & win32con.MONITORINFOF_PRIMARY),
+        }
+    except Exception:
+        return None
+
+
+def safe_rect(hwnd):
+    try:
+        return win32gui.GetWindowRect(hwnd)
+    except Exception:
+        return None
+
+
+def ask_dump_monitor(monitors):
+    """First-run setup: ask Daniel which monitor is the dump monitor and
+    how the board grid should look. Returns (device, cols, rows);
+    remembers them in foculet.json."""
+    choice = {}
+    rightmost = max(monitors, key=lambda m: m["rect"][0])["device"]
+
+    root = tk.Tk()
+    root.title("Foculet setup")
+    tk.Label(root,
+             text="Which monitor should be the dump monitor?\n"
+                  "Foculet will cover it with the parking picture board, so pick\n"
+                  "one you can dedicate to it.",
+             justify="left").pack(padx=16, pady=(16, 8))
+    var = tk.StringVar(value=rightmost)
+    for i, m in enumerate(monitors):
+        l, t, r, b = m["rect"]
+        pos = "left" if i == 0 else ("right" if i == len(monitors) - 1 else "middle")
+        label = f"Monitor {i + 1}: {r - l}x{b - t} at ({l},{t}) — {pos}" + \
+                (" — PRIMARY" if m["primary"] else "")
+        tk.Radiobutton(root, text=label, variable=var,
+                       value=m["device"], anchor="w",
+                       justify="left").pack(anchor="w", padx=16)
+
+    grid = tk.Frame(root)
+    grid.pack(padx=16, pady=(0, 4), anchor="w")
+    tk.Label(grid, text="Board grid:").pack(side="left")
+    cols_var = tk.IntVar(value=GRID_COLS)
+    rows_var = tk.IntVar(value=GRID_ROWS)
+    tk.Spinbox(grid, from_=1, to=8, width=3,
+               textvariable=cols_var).pack(side="left", padx=(8, 2))
+    tk.Label(grid, text="columns  x").pack(side="left")
+    tk.Spinbox(grid, from_=1, to=8, width=3,
+               textvariable=rows_var).pack(side="left", padx=(2, 2))
+    tk.Label(grid, text="rows").pack(side="left")
+
+    def ok():
+        choice["device"] = var.get()
+        try:
+            choice["cols"] = max(1, min(8, int(cols_var.get())))
+            choice["rows"] = max(1, min(8, int(rows_var.get())))
+        except Exception:
+            choice["cols"], choice["rows"] = GRID_COLS, GRID_ROWS
+        root.destroy()
+
+    tk.Button(root, text="Use this monitor", command=ok).pack(pady=16)
+    root.update_idletasks()
+    prim = next(m for m in monitors if m["primary"])
+    pl, pt, pr, pb = prim["rect"]
+    w, h = root.winfo_width(), root.winfo_height()
+    root.geometry(f"+{pl + (pr - pl) // 2 - w // 2}+{pt + (pb - pt) // 2 - h // 2}")
+    root.protocol("WM_DELETE_WINDOW", ok)  # closing picks the defaults
+    root.mainloop()
+    return (choice.get("device") or rightmost,
+            choice.get("cols") or GRID_COLS,
+            choice.get("rows") or GRID_ROWS)
+
+
+def pick_dump(monitors, spec):
+    if spec == "rightmost":
+        return max(monitors, key=lambda m: m["rect"][0])
+    if spec == "primary":
+        return next(m for m in monitors if m["primary"])
+    if spec.isdigit():
+        return monitors[int(spec) % len(monitors)]
+    for m in monitors:
+        if m["device"].lower() == spec.lower():
+            return m
+    raise ValueError(f"unknown --dump spec: {spec!r}")
+
+
+# ---------------------------------------------------------------- windows
+
+def exe_of(hwnd):
+    try:
+        _, pid = win32process.GetWindowThreadProcessId(hwnd)
+        h = win32api.OpenProcess(win32con.PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        try:
+            path = win32process.GetModuleFileNameEx(h, 0)
+        finally:
+            win32api.CloseHandle(h)
+        return os.path.basename(path).lower()
+    except Exception:
+        return ""
+
+
+def safe_title(hwnd):
+    try:
+        return win32gui.GetWindowText(hwnd).strip()
+    except Exception:
+        return ""
+
+
+def is_fullscreen(hwnd, rect):
+    mon = monitor_from_rect(rect)
+    return bool(mon) and tuple(rect) == tuple(mon["rect"])
+
+
+def is_owned(hwnd):
+    """True if the window is owned by another window (dialogs, popups,
+    dropdowns). Owned windows are never real switches and never parked."""
+    try:
+        return bool(win32gui.GetWindow(hwnd, win32con.GW_OWNER))
+    except Exception:
+        return False
+
+
+def parkable(hwnd, dump_device, excluded_exes):
+    """True if this window is eligible to be parked right now."""
+    if hwnd == OWN_CONSOLE:
+        return False
+    try:
+        if not win32gui.IsWindow(hwnd) or not win32gui.IsWindowVisible(hwnd):
+            return False
+        if win32gui.IsIconic(hwnd):
+            return False
+        if win32gui.GetParent(hwnd):          # not a top-level window
+            return False
+        if is_owned(hwnd):                    # a dialog/popup: belongs to
+            return False                      # its owner, never parked alone
+    except Exception:
+        return False
+    title = safe_title(hwnd)
+    if not title or title == "Program Manager":
+        return False
+    if exe_of(hwnd) in excluded_exes:
+        return False
+    try:
+        rect = win32gui.GetWindowRect(hwnd)
+    except Exception:
+        return False
+    if is_fullscreen(hwnd, rect):
+        return False                          # never yank a fullscreen app/game
+    mon = monitor_from_rect(rect)
+    if mon and mon["device"] == dump_device:
+        return False                          # already on the dump monitor
+    return True
+
+
+def is_alive(hwnd):
+    try:
+        return bool(win32gui.IsWindow(hwnd))
+    except Exception:
+        return False
+
+
+def is_maximized(hwnd):
+    try:
+        return win32gui.GetWindowPlacement(hwnd)[1] == win32con.SW_SHOWMAXIMIZED
+    except Exception:
+        return False
+
+
+def place(hwnd, x, y, w, h):
+    """Restore-if-maximized, then move without stealing focus.
+    Returns True only if the window actually moved."""
+    try:
+        if is_maximized(hwnd):
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+        win32gui.SetWindowPos(hwnd, 0, x, y, w, h,
+                              win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE)
+        return True
+    except Exception as e:
+        log(f"move failed for hwnd={hwnd}: {e}")
+        return False
+
+
+# ---------------------------------------------------------------- thumbnails
+
+def capture_thumbnail(hwnd, path, maxsize):
+    """Snap the window to a PNG thumbnail that fills a board cell.
+
+    Keeps the top ~62% of the window - title bar, tabs, toolbar, top of
+    the content: the part you actually recognize - then scales it to
+    cover maxsize, anchored top-left, so the picture fills its cell
+    with no empty bands.
+    Returns True on success."""
+    tmp = path + ".bmp"
+    try:
+        l, t, r, b = win32gui.GetWindowRect(hwnd)
+        w, h = r - l, b - t
+        if w <= 0 or h <= 0:
+            return False
+        hwnd_dc = win32gui.GetWindowDC(hwnd)
+        try:
+            mfc_dc = win32ui.CreateDCFromHandle(hwnd_dc)
+            save_dc = mfc_dc.CreateCompatibleDC()
+            try:
+                bmp = win32ui.CreateBitmap()
+                bmp.CreateCompatibleBitmap(mfc_dc, w, h)
+                save_dc.SelectObject(bmp)
+                if not print_window(hwnd, save_dc.GetSafeHdc()):
+                    return False
+                bmp.SaveBitmapFile(save_dc, tmp)
+            finally:
+                save_dc.DeleteDC()
+                mfc_dc.DeleteDC()
+        finally:
+            win32gui.ReleaseDC(hwnd, hwnd_dc)
+        img = Image.open(tmp).convert("RGB")
+        if img.getbbox() is None:
+            return False  # captured nothing but black
+        tw, th = maxsize
+        # the recognizable part lives at the top: crop there first
+        img = img.crop((0, 0, img.width, int(img.height * 0.62)))
+        # scale to cover the cell, anchored top-left (keeps tabs/title)
+        scale = max(tw / img.width, th / img.height)
+        img = img.resize((max(1, int(img.width * scale + 0.5)),
+                          max(1, int(img.height * scale + 0.5))),
+                         Image.LANCZOS)
+        img = img.crop((0, 0, tw, th))
+        img.save(path, "PNG")
+        return True
+    except Exception as e:
+        log(f"thumbnail failed: {e}")
+        return False
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+
+
+def make_placeholder_thumb(path, title, size=(296, 200)):
+    """Fallback picture when a window refuses to be screenshotted."""
+    try:
+        img = Image.new("RGB", size, "#242424")
+        d = ImageDraw.Draw(img)
+        txt = (title[:40] + "…") if len(title) > 40 else title
+        d.text((16, size[1] // 2 - 8), txt or "(no title)", fill="#bbbbbb")
+        img.save(path, "PNG")
+    except Exception as e:
+        log(f"placeholder failed: {e}")
+
+
+# -------------------------------------------------------------- foculet
+
+BRIDGE_URL = "http://127.0.0.1:18721"
+
+
+def bridge_cmd(action, args=None, timeout=10):
+    """Send a command to the Memyr Chrome bridge on this PC.
+
+    Returns (ok, data_or_error). Quietly reports unreachable/timeout -
+    the caller decides how loudly to complain."""
+    try:
+        body = json.dumps({"action": action, "args": args or {}}).encode()
+        req = urllib.request.Request(
+            BRIDGE_URL + "/cmd", data=body,
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            cid = json.loads(r.read().decode()).get("id")
+        if not cid:
+            return False, "no command id"
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                with urllib.request.urlopen(
+                        BRIDGE_URL + "/result/" + cid, timeout=5) as r:
+                    res = json.loads(r.read().decode())
+            except Exception:
+                time.sleep(0.5)
+                continue
+            if res.get("pending"):
+                time.sleep(0.5)
+                continue
+            if res.get("ok"):
+                return True, res.get("data")
+            return False, res.get("error")
+        return False, "extension did not respond"
+    except Exception as e:
+        return False, "bridge unreachable: %s" % (e,)
+
+
+class Foculet:
+    def __init__(self, dump_spec, excluded_exes,
+                 grid_cols=GRID_COLS, grid_rows=GRID_ROWS):
+        self.excluded = set(excluded_exes)
+        self.monitors = list_monitors()
+        self.by_device = {m["device"]: m for m in self.monitors}
+        self.dump = pick_dump(self.monitors, dump_spec)
+        try:
+            grid_cols = max(1, min(8, int(grid_cols)))
+            grid_rows = max(1, min(8, int(grid_rows)))
+        except Exception:
+            grid_cols, grid_rows = GRID_COLS, GRID_ROWS
+        self.grid_cols = grid_cols
+        self.grid_rows = grid_rows
+        self.max_parked = grid_cols * grid_rows  # board slots = grid cells
+        # thumbnail size that fills a board cell: dump work area minus
+        # the board/cell padding, minus room for the title label
+        wl, wt, wr, wb = self.dump["work"]
+        cell_w = (wr - wl - 24) // grid_cols - 12
+        cell_h = (wb - wt - 24) // grid_rows - 12
+        self.thumb_max = (max(240, cell_w - 8), max(160, cell_h - 48))
+        self.lock = threading.Lock()
+        self._tab_op = threading.Event()  # set while a tab tear-off is in flight
+        self._quiet_until = 0.0  # focus changes before this are ours
+                                 # (minimize/restore); the watcher absorbs
+                                 # them instead of treating them as switches
+        self.parked = {}  # hwnd -> {"origin_rect", "origin_device", "exe",
+                          #          "title", "thumb", "was_maximized"}
+        self.current = {}  # monitor device -> hwnd currently owning that screen
+        self._thumb_seq = 0
+        os.makedirs(THUMB_DIR, exist_ok=True)
+        # clear stale thumbnails from a previous run
+        for f in os.listdir(THUMB_DIR):
+            if f.endswith(".png"):
+                try:
+                    os.remove(os.path.join(THUMB_DIR, f))
+                except Exception:
+                    pass
+        log(f"monitors: {[(m['device'], m['rect'], 'PRIMARY' if m['primary'] else '') for m in self.monitors]}")
+        log(f"dump monitor: {self.dump['device']} {self.dump['rect']}")
+        log(f"mode: park on every switch, board "
+            f"{self.grid_cols}x{self.grid_rows}, "
+            f"excluded: {sorted(self.excluded) or 'none'}")
+
+    # -- parking ----------------------------------------------------
+
+    def park(self, hwnd):
+        with self.lock:
+            if len(self.parked) >= self.max_parked:
+                log(f"board full ({self.max_parked}); "
+                    f"not parking '{safe_title(hwnd)}'")
+                return
+        try:
+            rect = win32gui.GetWindowRect(hwnd)
+        except Exception:
+            return
+        mon = monitor_from_rect(rect)
+        title = safe_title(hwnd)
+        with self.lock:
+            self._thumb_seq += 1
+            seq = self._thumb_seq
+        thumb = os.path.join(THUMB_DIR, f"{hwnd}_{seq}.png")
+        if not capture_thumbnail(hwnd, thumb, self.thumb_max):
+            make_placeholder_thumb(thumb, title, self.thumb_max)
+        was_max = is_maximized(hwnd)
+        try:
+            win32gui.ShowWindow(hwnd, win32con.SW_MINIMIZE)
+        except Exception as e:
+            log(f"could not minimize '{title}': {e}")
+            try:
+                os.remove(thumb)
+            except Exception:
+                pass
+            return
+        # minimizing moves focus; don't read that as the user switching
+        with self.lock:
+            self._quiet_until = time.time() + 1.5
+        with self.lock:
+            self.parked[hwnd] = {
+                "origin_rect": rect,
+                "origin_device": mon["device"] if mon else None,
+                "exe": exe_of(hwnd),
+                "title": title,
+                "thumb": thumb,
+                "was_maximized": was_max,
+                "parked_at": time.time(),  # board sorts oldest-first
+            }
+            for dev, h in list(self.current.items()):
+                if h == hwnd:
+                    del self.current[dev]  # no longer any screen's current window
+        log(f"PARKED '{title}' -> {self.dump['device']}")
+
+    def unpark(self, hwnd):
+        with self.lock:
+            p = self.parked.pop(hwnd, None)
+        if not p:
+            return
+        mon = self.by_device.get(p["origin_device"]) or \
+            next(m for m in self.monitors if m["primary"])
+        l, t, r, b = p["origin_rect"]
+        wl, wt, wr, wb = mon["work"]
+        w, h = min(r - l, wr - wl), min(b - t, wb - wt)
+        x, y = min(max(l, wl), wr - w), min(max(t, wt), wb - h)
+        try:
+            # un-minimize first, then move home without stealing focus
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            if not place(hwnd, x, y, w, h):
+                raise RuntimeError("window would not move")
+            if p.get("was_maximized"):
+                win32gui.ShowWindow(hwnd, win32con.SW_MAXIMIZE)
+            win32gui.SetForegroundWindow(hwnd)
+            # restoring moves focus on purpose; absorb the echo
+            with self.lock:
+                self._quiet_until = time.time() + 1.5
+        except Exception as e:
+            log(f"could not unpark '{p['title']}': {e}")
+            with self.lock:
+                self.parked[hwnd] = p  # keep it parked
+            return
+        try:
+            os.remove(p["thumb"])
+        except Exception:
+            pass
+        with self.lock:
+            self.current[mon["device"]] = hwnd  # it owns its home screen again
+        log(f"UNPARKED '{p['title']}' -> {mon['device']}")
+
+    def close_parked(self, hwnd):
+        """Close the real window behind a board picture (right-click it).
+
+        Sends a graceful close; sweep_dead() forgets the window and drops
+        its picture on the next watcher tick."""
+        with self.lock:
+            p = self.parked.get(hwnd)
+        if not p:
+            return
+        try:
+            win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+            log(f"CLOSE requested for '{p['title']}'")
+        except Exception as e:
+            log(f"could not close '{p['title']}': {e}")
+
+    def sweep_dead(self):
+        """Forget parked windows the user closed; delete their pictures."""
+        gone = []
+        with self.lock:
+            for h in list(self.parked):
+                if not is_alive(h):
+                    gone.append(self.parked.pop(h))
+        for p in gone:
+            log(f"forgot closed window '{p['title']}'")
+            try:
+                os.remove(p["thumb"])
+            except Exception:
+                pass
+
+    def parked_keys(self):
+        with self.lock:
+            return set(self.parked)
+
+    # -- picture board (runs on the main/Tk thread) ------------------
+
+    def build_lot(self):
+        self.root = tk.Tk()
+        self.root.title("Foculet")
+        self.root.configure(bg="#141414")
+        self.root.overrideredirect(True)  # borderless: just the board
+        wl, wt, wr, wb = self.dump["work"]
+        self.root.geometry(f"{wr - wl}x{wb - wt}+{wl}+{wt}")
+        self.grid_frame = tk.Frame(self.root, bg="#141414")
+        self.grid_frame.pack(expand=True, fill="both", padx=12, pady=12)
+        for c in range(self.grid_cols):
+            self.grid_frame.grid_columnconfigure(c, weight=1, uniform="cell")
+        for r in range(self.grid_rows):
+            self.grid_frame.grid_rowconfigure(r, weight=1, uniform="cell")
+        self._lot_key = None
+        self._photos = []
+        self.root.withdraw()  # hidden until the first window parks
+        try:
+            # the board must never steal focus: deiconify() can activate
+            # a window on Windows, and an activated board would read as
+            # a "switch" and cascade into parks
+            bh = self.root.winfo_id()
+            ex = win32gui.GetWindowLong(bh, win32con.GWL_EXSTYLE)
+            win32gui.SetWindowLong(bh, win32con.GWL_EXSTYLE,
+                                   ex | win32con.WS_EX_NOACTIVATE)
+        except Exception as e:
+            log(f"board noactivate failed: {e}")
+        self.root.after(500, self.refresh_lot)
+
+    def rebuild_lot(self, items):
+        for w in self.grid_frame.winfo_children():
+            w.destroy()
+        self._photos = []
+        for i in range(self.max_parked):
+            cell = tk.Frame(self.grid_frame, bg="#1e1e1e",
+                            highlightbackground="#333333", highlightthickness=1)
+            cell.grid(row=i // self.grid_cols, column=i % self.grid_cols,
+                      padx=6, pady=6, sticky="nsew")
+            if i < len(items):
+                hwnd, title, thumb = items[i]
+                photo = None
+                try:
+                    if os.path.exists(thumb):
+                        photo = ImageTk.PhotoImage(Image.open(thumb))
+                    else:
+                        log(f"thumb gone for '{title}' (raced an unpark)")
+                except Exception as e:
+                    log(f"thumb load failed for '{title}': {e}")
+                if photo:
+                    self._photos.append(photo)  # keep a reference
+                    pic = tk.Label(cell, image=photo, bg="#1e1e1e",
+                                   cursor="hand2")
+                    pic.pack(expand=True)
+                    pic.bind("<Button-1>", lambda e, h=hwnd: self.unpark(h))
+                    pic.bind("<Button-3>",
+                             lambda e, h=hwnd: self.close_parked(h))
+                name = (title[:34] + "…") if len(title) > 34 else title
+                tl = tk.Label(cell, text=name or "(no title)", fg="#bbbbbb",
+                              bg="#1e1e1e", font=("Segoe UI", 9),
+                              cursor="hand2")
+                tl.pack(pady=(0, 6))
+                tl.bind("<Button-1>", lambda e, h=hwnd: self.unpark(h))
+                tl.bind("<Button-3>", lambda e, h=hwnd: self.close_parked(h))
+                # right-click anywhere on the picture: close that window
+                cell.bind("<Button-1>", lambda e, h=hwnd: self.unpark(h))
+                cell.bind("<Button-3>",
+                          lambda e, h=hwnd: self.close_parked(h))
+
+    def refresh_lot(self):
+        try:
+            with self.lock:
+                # oldest parked first: the board reads like a timeline
+                ordered = sorted(self.parked.items(),
+                                 key=lambda kv: kv[1].get("parked_at", 0))
+                items = [(h, p["title"], p["thumb"])
+                         for h, p in ordered if is_alive(h)]
+            key = tuple(h for h, _, _ in items)
+            if key != self._lot_key:
+                if items:
+                    self.root.deiconify()
+                    self.root.lower()  # stay at the bottom of the z-order
+                else:
+                    self.root.withdraw()
+                self.rebuild_lot(items)
+                # advance the key only after a successful build, so a
+                # failed render retries on the next tick instead of
+                # freezing the board on stale/empty cells
+                self._lot_key = key
+                log(f"board: {len(items)} picture(s)")
+        except Exception as e:
+            log(f"lot refresh failed: {e}")
+        self.root.after(500, self.refresh_lot)
+
+    # -- focus watcher (runs on a background thread) -----------------
+
+    def watcher(self):
+        log("foculet running - every switch parks the screen's previous window.")
+        prev = None
+        while True:
+            time.sleep(POLL_SECS)
+            try:
+                fg = win32gui.GetForegroundWindow()
+            except Exception:
+                continue
+            self.sweep_dead()
+
+            if fg != prev:
+                # a switch happened: prev -> fg. while a tab tear-off is
+                # in flight the tab thread owns focus changes; just track.
+                # right after our own minimize/restore, absorb the focus
+                # echo instead of reading it as another switch (that echo
+                # is what used to cascade: park -> focus jump -> park...)
+                with self.lock:
+                    quiet = time.time() < self._quiet_until
+                if not self._tab_op.is_set() and not quiet:
+                    self.on_fg_change(fg)
+                prev = fg
+
+    def on_fg_change(self, fg):
+        # each screen remembers its current window; the moment you
+        # focus a new window on a screen, that screen's previous
+        # window gets its picture taken and is parked on the board.
+        if fg and is_owned(fg):
+            return  # a dialog/popup opened (file picker, save dialog):
+                    # not a real switch - leave the owner window alone
+        if fg in self.parked_keys():
+            # A parked window became foreground. That can be a deliberate
+            # restore (taskbar click, board is separate) - or just a
+            # passing glance: Alt+Tab preview, taskbar hover peek, or an
+            # app raising itself for a moment. Only unpark it if it
+            # stays put; a glance leaves it parked.
+            time.sleep(1.0)
+            try:
+                still_there = win32gui.GetForegroundWindow() == fg
+            except Exception:
+                still_there = False
+            if still_there and fg in self.parked_keys():
+                self.unpark(fg)
+            return
+        fg_rect = safe_rect(fg) if fg else None
+        fg_mon = monitor_from_rect(fg_rect) if fg_rect else None
+        if fg and fg_mon and fg_mon["device"] != self.dump["device"]:
+            dev = fg_mon["device"]
+            with self.lock:
+                prev_current = self.current.get(dev)
+            if (prev_current and prev_current != fg
+                    and prev_current not in self.parked_keys()
+                    and parkable(prev_current, self.dump["device"],
+                                 self.excluded)):
+                self.park(prev_current)  # park() enforces the board cap
+            if fg != OWN_CONSOLE:
+                with self.lock:
+                    self.current[dev] = fg
+
+    # -- chrome tab parking (runs on a background thread) -------------
+
+    def is_chrome_window(self, hwnd):
+        buf = ctypes.create_unicode_buffer(64)
+        try:
+            if not ctypes.windll.user32.GetClassNameW(hwnd, buf, 64):
+                return False
+        except Exception:
+            return False
+        return buf.value == "Chrome_WidgetWin_1"
+
+    def chrome_hwnds(self):
+        """Set of visible top-level Chrome window handles right now."""
+        out = set()
+
+        def cb(hwnd, _):
+            try:
+                if win32gui.IsWindowVisible(hwnd) \
+                        and self.is_chrome_window(hwnd):
+                    out.add(hwnd)
+            except Exception:
+                pass
+            return True
+
+        try:
+            win32gui.EnumWindows(cb, None)
+        except Exception:
+            pass
+        return out
+
+    def tab_watcher(self):
+        """Poll Chrome for tab switches in the focused window.
+
+        When Daniel switches tabs, the tab he just left is torn off into
+        its own window and parked on the dump board like any other window.
+        """
+        last_active = {}  # chrome windowId -> active tabId
+        warned = False
+        while True:
+            time.sleep(1.0)
+            try:
+                ok, state = bridge_cmd("chrome_state", timeout=12)
+            except Exception as e:
+                ok, state = False, str(e)
+            if not ok:
+                if not warned:
+                    log(f"chrome bridge unavailable ({state}); "
+                        f"tab parking paused")
+                    warned = True
+                time.sleep(4.0)
+                continue
+            warned = False
+            wins = {w["id"]: w for w in state.get("windows", [])}
+            for wid in list(last_active):
+                if wid not in wins:
+                    del last_active[wid]
+            fwin = next((w for w in wins.values() if w.get("focused")), None)
+            if not fwin:
+                continue
+            wid = fwin["id"]
+            tabs = [t for t in state.get("tabs", [])
+                    if t.get("windowId") == wid]
+            active = next((t for t in tabs if t.get("active")), None)
+            if not active:
+                continue
+            tid = active["id"]
+            prev = last_active.get(wid)
+            if prev is None or prev == tid \
+                    or not any(t["id"] == prev for t in tabs):
+                last_active[wid] = tid
+            elif self.tear_off_tab(fwin, prev):
+                last_active[wid] = tid
+            # else: detach failed; keep prev so the next poll retries it
+
+    def tear_off_tab(self, fwin, old_tab):
+        """Tear old_tab off into its own window and park it.
+
+        Returns True when the tab is handled (parked, or deliberately left
+        alone) and False when the detach failed and the watcher should
+        retry on its next poll.
+        """
+        # never tear off tabs from a Chrome window on the dump monitor
+        cx = (fwin.get("left") or 0) + (fwin.get("width") or 0) // 2
+        cy = (fwin.get("top") or 0) + (fwin.get("height") or 0) // 2
+        mon = monitor_from_rect((cx, cy, cx + 1, cy + 1))
+        if mon and mon["device"] == self.dump["device"]:
+            return True
+        self._tab_op.set()
+        try:
+            before = self.chrome_hwnds()
+            ok, data = bridge_cmd("detach_tab", {"tabId": old_tab},
+                                  timeout=30)
+            if not ok:
+                log(f"chrome detach failed ({data}); will retry")
+                return False
+            new_wid = (data or {}).get("windowId")
+            # the torn-off window is brand new: find it by diffing the
+            # visible Chrome windows instead of racing the foreground
+            new_hwnd = None
+            deadline = time.time() + 5.0
+            while time.time() < deadline and new_hwnd is None:
+                diff = self.chrome_hwnds() - before
+                if len(diff) == 1:
+                    new_hwnd = diff.pop()
+                elif diff:
+                    fg = win32gui.GetForegroundWindow()
+                    if fg in diff:
+                        new_hwnd = fg
+                        break
+                time.sleep(0.25)
+            # confirm the detach really happened: our tab alone in the
+            # returned window, and that window focused
+            verified = False
+            ok2, state = bridge_cmd("chrome_state", timeout=12)
+            if ok2 and new_wid:
+                wins = {w["id"]: w for w in state.get("windows", [])}
+                winfo = wins.get(new_wid)
+                wtabs = [t["id"] for t in state.get("tabs", [])
+                         if t.get("windowId") == new_wid]
+                verified = bool(winfo and winfo.get("focused")
+                                and wtabs == [old_tab])
+            if not verified:
+                log("chrome detach: not verified, leaving window alone")
+                return True
+            if new_hwnd and parkable(new_hwnd, self.dump["device"],
+                                     self.excluded):
+                log(f"tab torn off -> '{safe_title(new_hwnd)}'")
+                self.park(new_hwnd)
+            else:
+                log(f"chrome detach: torn-off window not parkable "
+                    f"(hwnd={new_hwnd})")
+            return True
+        except Exception as e:
+            log(f"tear_off_tab failed: {e}")
+            return False
+        finally:
+            self._tab_op.clear()
+
+    def run(self):
+        self.build_lot()
+        t = threading.Thread(target=self.watcher, daemon=True,
+                             name="foculet-watcher")
+        t.start()
+        c = threading.Thread(target=self.tab_watcher, daemon=True,
+                             name="foculet-tabs")
+        c.start()
+        self.root.mainloop()
+
+
+def load_config(path):
+    cfg = {"excluded_exes": []}
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            cfg.update(json.load(f))
+    return cfg
+
+
+def save_config(path, cfg):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Foculet - parks your previous window on the dump monitor")
+    ap.add_argument("--dump", default=None,
+                    help="rightmost | primary | <index> | <device name>")
+    ap.add_argument("--config", default=os.path.join(HERE, "foculet.json"))
+    args = ap.parse_args()
+
+    cfg = load_config(args.config)
+    dump = args.dump or cfg.get("dump_monitor")
+    grid_cols = cfg.get("grid_cols", GRID_COLS)
+    grid_rows = cfg.get("grid_rows", GRID_ROWS)
+    if not dump:
+        # first run: ask which monitor is the dump and how the board
+        # should look, then remember it
+        dump, grid_cols, grid_rows = ask_dump_monitor(list_monitors())
+        cfg["dump_monitor"] = dump
+        cfg["grid_cols"] = grid_cols
+        cfg["grid_rows"] = grid_rows
+        save_config(args.config, cfg)
+        log(f"dump monitor chosen: {dump} (board {grid_cols}x{grid_rows})")
+
+    app = Foculet(dump, cfg["excluded_exes"], grid_cols, grid_rows)
+    try:
+        app.run()
+    except KeyboardInterrupt:
+        log("stopped.")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        traceback.print_exc()
+        sys.exit(1)
