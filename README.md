@@ -53,7 +53,7 @@ state and sends it detach/close commands.
 ## Requirements
 
 - Windows 10 or 11
-- Python 3.10+ with `pywin32` and `Pillow` (`pip install pywin32 pillow`)
+- Python 3.10+ with `pywin32`, `Pillow`, and `pystray` (`pip install pywin32 pillow pystray`)
 - Google Chrome (only needed for tab parking; the window parker works alone)
 
 ## Install
@@ -61,7 +61,7 @@ state and sends it detach/close commands.
 ```powershell
 git clone https://github.com/dt-memyrlabs/foculet.git
 cd foculet
-pip install pywin32 pillow
+pip install pywin32 pillow pystray
 
 # 1. Bridge server (leave running) — lets the extension talk to Foculet
 python bridge-server.py
@@ -69,9 +69,12 @@ python bridge-server.py
 # 2. Chrome extension — chrome://extensions → Developer mode →
 #    "Load unpacked" → select the extension/ folder
 
-# 3. Foculet itself
+# 3. Foculet itself (no console window - it lives in the system tray)
 .\ctl.ps1 -Action start
 ```
+
+The tray icon (bottom-right) shows the parked count, and its menu has
+Pause parking / Resume parking and Exit. Right-click it anytime.
 
 On first run Foculet shows a small monitor picker if it can't tell which
 monitor is the dump — pick one and it's saved to `foculet.json`.
