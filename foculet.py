@@ -475,7 +475,7 @@ class Foculet:
                                  # them instead of treating them as switches
         self._paused = threading.Event()  # set from the tray menu: parking
                                           # halts until resumed
-        self._tray = None  # pystray icon, once start_tray() builds it
+        self._tray_hwnd = None  # tray message window (tray thread)
         self.parked = {}  # hwnd -> {"origin_rect", "origin_device", "exe",
                           #          "title", "thumb", "was_maximized"}
         self.current = {}  # monitor device -> hwnd currently owning that screen
@@ -610,67 +610,129 @@ class Foculet:
         with self.lock:
             return set(self.parked)
 
-    # -- system tray (runs on its own thread; no console window needed) ---
+    # -- system tray: raw win32, no extra libraries --------------------
+    # A dedicated thread owns a hidden message window and registers the
+    # icon with Shell_NotifyIcon - the same API every native Windows app
+    # uses. Left- or right-click opens the menu.
 
-    def _tray_image(self):
-        from PIL import ImageFont
-        letter = (self.root.title() or "F")[0].upper()
-        img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
-        d = ImageDraw.Draw(img)
-        d.rounded_rectangle([4, 4, 60, 60], radius=14, fill=(217, 154, 43))
+    _TRAY_ID_PAUSE = 1001
+    _TRAY_ID_EXIT = 1002
+
+    def _make_tray_hicon(self):
+        """Build the amber .ico next to the script; return an HICON."""
+        here = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(here, "tray.ico")
         try:
-            font = ImageFont.truetype("segoeui.ttf", 38)
+            from PIL import ImageFont
+            letter = (self.root.title() or "V")[0].upper()
+            img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+            d = ImageDraw.Draw(img)
+            d.rounded_rectangle([4, 4, 60, 60], radius=14,
+                                fill=(217, 154, 43, 255))
+            try:
+                font = ImageFont.truetype("segoeui.ttf", 38)
+            except Exception:
+                font = ImageFont.load_default()
+            d.text((32, 34), letter, fill=(20, 20, 20, 255),
+                   font=font, anchor="mm")
+            img.resize((32, 32), Image.LANCZOS).save(path, format="ICO")
+        except Exception as e:
+            log(f"tray icon build failed: {e}")
+        try:
+            return win32gui.LoadImage(0, path, win32con.IMAGE_ICON,
+                                      0, 0, win32con.LR_LOADFROMFILE)
+        except Exception as e:
+            log(f"tray icon load failed ({e}); using stock icon")
+            return win32gui.LoadIcon(0, win32con.IDI_APPLICATION)
+
+    def _show_tray_menu(self, hwnd):
+        name = self.root.title() or "Valet"
+        with self.lock:
+            n = len(self.parked)
+        menu = win32gui.CreatePopupMenu()
+        win32gui.AppendMenu(menu,
+                            win32con.MF_STRING | win32con.MF_DISABLED,
+                            0, name)
+        win32gui.AppendMenu(menu,
+                            win32con.MF_STRING | win32con.MF_DISABLED,
+                            0, "1 parked" if n == 1 else f"{n} parked")
+        win32gui.AppendMenu(menu, win32con.MF_SEPARATOR, 0, "")
+        win32gui.AppendMenu(menu, win32con.MF_STRING, self._TRAY_ID_PAUSE,
+                            "Resume parking" if self._paused.is_set()
+                            else "Pause parking")
+        win32gui.AppendMenu(menu, win32con.MF_STRING, self._TRAY_ID_EXIT,
+                            "Exit")
+        x, y = win32gui.GetCursorPos()
+        win32gui.SetForegroundWindow(hwnd)
+        win32gui.TrackPopupMenu(menu, win32con.TPM_LEFTALIGN,
+                                x, y, 0, hwnd, None)
+        win32gui.PostMessage(hwnd, win32con.WM_NULL, 0, 0)
+        win32gui.DestroyMenu(menu)
+
+    def _tray_wndproc(self, hwnd, msg, wparam, lparam):
+        WM_TRAY = win32con.WM_USER + 20
+        if msg == WM_TRAY:
+            if lparam in (win32con.WM_LBUTTONUP, win32con.WM_RBUTTONUP):
+                self._show_tray_menu(hwnd)
+            return 0
+        if msg == win32con.WM_COMMAND:
+            wid = win32api.LOWORD(wparam)
+            if wid == self._TRAY_ID_PAUSE:
+                if self._paused.is_set():
+                    self._paused.clear()
+                    log("parking resumed from tray")
+                else:
+                    self._paused.set()
+                    log("parking paused from tray")
+            elif wid == self._TRAY_ID_EXIT:
+                log("exit requested from tray")
+                try:
+                    win32gui.Shell_NotifyIcon(win32gui.NIM_DELETE, (hwnd, 0))
+                finally:
+                    win32gui.DestroyWindow(hwnd)
+                    # Tk must die on its own thread
+                    self.root.after(0, self.root.destroy)
+            return 0
+        if msg == win32con.WM_DESTROY:
+            try:
+                win32gui.Shell_NotifyIcon(win32gui.NIM_DELETE, (hwnd, 0))
+            except Exception:
+                pass
+            win32gui.PostQuitMessage(0)
+            return 0
+        return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
+
+    def _tray_main(self):
+        WM_TRAY = win32con.WM_USER + 20
+        name = self.root.title() or "Valet"
+        hicon = self._make_tray_hicon()
+        wc = win32gui.WNDCLASS()
+        wc.lpfnWndProc = self._tray_wndproc
+        wc.lpszClassName = "ValetTrayWindow"
+        try:
+            win32gui.RegisterClass(wc)
         except Exception:
-            font = ImageFont.load_default()
-        d.text((32, 34), letter, fill=(20, 20, 20), font=font, anchor="mm")
-        return img
+            pass  # already registered
+        hwnd = win32gui.CreateWindow(wc.lpszClassName, name,
+                                     0, 0, 0, 0, 0, 0, 0, 0, None)
+        self._tray_hwnd = hwnd
+        nid = (hwnd, 0,
+               win32gui.NIF_ICON | win32gui.NIF_MESSAGE | win32gui.NIF_TIP,
+               WM_TRAY, hicon, name)
+        try:
+            win32gui.Shell_NotifyIcon(win32gui.NIM_ADD, nid)
+        except Exception as e:
+            log(f"tray icon registration failed: {e}")
+            self._tray_hwnd = None
+            return
+        log("tray icon running")
+        win32gui.PumpMessages()
+        self._tray_hwnd = None
 
     def start_tray(self):
-        try:
-            import pystray
-        except ImportError:
-            log("pystray not installed: no tray icon "
-                "(pip install pystray to get one)")
-            return
-        name = self.root.title() or "Foculet"
-
-        def parked_label(item):
-            with self.lock:
-                n = len(self.parked)
-            return f"{n} parked" if n != 1 else "1 parked"
-
-        def pause_label(item):
-            return "Resume parking" if self._paused.is_set() \
-                else "Pause parking"
-
-        def toggle_pause(icon, item):
-            if self._paused.is_set():
-                self._paused.clear()
-                log("parking resumed from tray")
-            else:
-                self._paused.set()
-                log("parking paused from tray")
-
-        def do_exit(icon, item):
-            log("exit requested from tray")
-            try:
-                icon.stop()  # remove the icon; thread ends
-            finally:
-                # Tk must die on its own thread
-                self.root.after(0, self.root.destroy)
-
-        menu = pystray.Menu(
-            pystray.MenuItem(name, lambda i, _: None, enabled=False),
-            pystray.MenuItem(parked_label, lambda i, _: None, enabled=False),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem(pause_label, toggle_pause),
-            pystray.MenuItem("Exit", do_exit),
-        )
-        self._tray = pystray.Icon(name, self._tray_image(), name, menu)
-        t = threading.Thread(target=self._tray.run, daemon=True,
-                             name="foculet-tray")
+        t = threading.Thread(target=self._tray_main, daemon=True,
+                             name="valet-tray")
         t.start()
-        log("tray icon running")
 
     # -- picture board (runs on the main/Tk thread) ------------------
 
@@ -769,12 +831,15 @@ class Foculet:
                 # freezing the board on stale/empty cells
                 self._lot_key = key
                 log(f"board: {len(items)} picture(s)")
-            if self._tray is not None:
+            hwnd = self._tray_hwnd
+            if hwnd:
                 try:
                     n = len(items)
-                    self._tray.title = \
-                        f"{self.root.title()} - {n} parked" if n != 1 else \
-                        f"{self.root.title()} - 1 parked"
+                    tip = f"{self.root.title()} - 1 parked" if n == 1 else \
+                        f"{self.root.title()} - {n} parked"
+                    win32gui.Shell_NotifyIcon(
+                        win32gui.NIM_MODIFY,
+                        (hwnd, 0, win32gui.NIF_TIP, 0, 0, tip))
                 except Exception:
                     pass
         except Exception as e:
