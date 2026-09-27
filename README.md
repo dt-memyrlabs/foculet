@@ -180,6 +180,11 @@ foculet/
 └── LICENSE               # MIT
 ```
 
+## Sponsor
+
+Foculet is free and open source. If it saves your attention, sponsoring it
+tells us how many people it helps — and keeps the core free forever.
+
 ## License
 
 MIT — see `LICENSE`. Copyright (c) 2026 Daniel Thomas.
