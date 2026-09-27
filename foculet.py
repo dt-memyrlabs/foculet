@@ -4,7 +4,7 @@ Foculet - a Windows focus-parking app.
 
 The loop:
   * every time you switch to a new window on a screen, that screen's
-    previous window is "parked": Foculet snaps a thumbnail picture of it,
+    previous window is "parked": Valet snaps a thumbnail picture of it,
     minimizes the real window, and pins the picture to the board on
     the dump monitor - a giant taskbar of pictures of what you were doing
   * click a picture -> the real window restores to the monitor it came from
@@ -20,6 +20,7 @@ Usage:
 import argparse
 import ctypes
 import json
+import math
 import os
 import sys
 import threading
@@ -58,6 +59,7 @@ LOG_PATH = os.path.join(HERE, "foculet.log")
 THUMB_DIR = os.path.join(HERE, "thumbs")
 
 POLL_SECS = 0.5
+CLOSE_UNDO_SECS = 20  # right-click arms a close; undo window
 GRID_COLS = 3            # default board grid; Daniel can change it in
 GRID_ROWS = 2            # foculet.json (grid_cols/grid_rows) or the setup picker
 THUMB_MAX = (560, 400)   # fallback; the real size is computed from the
@@ -80,12 +82,12 @@ def log(msg):
         pass
 
 
-CRASH_PATH = os.path.join(HERE, "valet-crash.log")
+CRASH_PATH = os.path.join(HERE, "foculet-crash.log")
 _crash_fh = None  # held open for faulthandler; see _install_crash_handlers
 
 
 def _install_crash_handlers():
-    """Log every otherwise-silent death to valet-crash.log.
+    """Log every otherwise-silent death to foculet-crash.log.
 
     Under pythonw there is no console, so an unhandled exception in the
     watcher thread, the tray thread, or a Tk callback would vanish
@@ -95,7 +97,7 @@ def _install_crash_handlers():
     global _crash_fh
     import faulthandler
     _crash_fh = open(CRASH_PATH, "a", encoding="utf-8", buffering=1)
-    _crash_fh.write(f"\n=== valet started pid={os.getpid()} "
+    _crash_fh.write(f"\n=== foculet started pid={os.getpid()} "
                     f"at {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
     faulthandler.enable(file=_crash_fh)
 
@@ -108,7 +110,7 @@ def _install_crash_handlers():
             _crash_fh.write("\n")
         except Exception:
             pass
-        log(f"CRASH ({kind}): {exc!r} -- full traceback in valet-crash.log")
+        log(f"CRASH ({kind}): {exc!r} -- full traceback in foculet-crash.log")
 
     def _excepthook(typ, val, tb):
         _write("main thread", val)
@@ -168,10 +170,10 @@ def ask_dump_monitor(monitors):
     rightmost = max(monitors, key=lambda m: m["rect"][0])["device"]
 
     root = tk.Tk()
-    root.title("Foculet setup")
+    root.title("Valet setup")
     tk.Label(root,
              text="Which monitor should be the dump monitor?\n"
-                  "Foculet will cover it with the parking picture board, so pick\n"
+                  "Valet will cover it with the parking picture board, so pick\n"
                   "one you can dedicate to it.",
              justify="left").pack(padx=16, pady=(16, 8))
     var = tk.StringVar(value=rightmost)
@@ -458,7 +460,7 @@ def make_placeholder_thumb(path, title, size=(296, 200)):
         log(f"placeholder failed: {e}")
 
 
-# -------------------------------------------------------------- foculet
+# ---------------------------------------------------------------- foculet
 
 BRIDGE_URL = "http://127.0.0.1:18721"
 
@@ -497,7 +499,7 @@ def bridge_cmd(action, args=None, timeout=10):
         return False, "bridge unreachable: %s" % (e,)
 
 
-class Foculet:
+class Valet:
     def __init__(self, dump_spec, excluded_exes,
                  grid_cols=GRID_COLS, grid_rows=GRID_ROWS):
         self.excluded = set(excluded_exes)
@@ -593,6 +595,8 @@ class Foculet:
         log(f"PARKED '{title}' -> {self.dump['device']}")
 
     def unpark(self, hwnd):
+        if hwnd in self._pending_close:
+            self._cancel_close(hwnd, "restored")
         with self.lock:
             p = self.parked.pop(hwnd, None)
         if not p:
@@ -628,22 +632,66 @@ class Foculet:
         log(f"UNPARKED '{p['title']}' -> {mon['device']}")
 
     def close_parked(self, hwnd):
-        """Close the real window behind a board picture (right-click it).
+        """Arm/cancel a delayed close (right-click a board picture).
 
-        Sends a graceful close; sweep_dead() forgets the window and drops
-        its picture on the next watcher tick."""
+        Gmail-style: the window only really closes after CLOSE_UNDO_SECS.
+        Until then the cell shows a red countdown — right-click again or
+        left-click (restore) to cancel."""
         with self.lock:
             p = self.parked.get(hwnd)
         if not p:
             return
+        if hwnd in self._pending_close:
+            self._cancel_close(hwnd, "toggled off")
+        else:
+            self._pending_close[hwnd] = {
+                "deadline": time.time() + CLOSE_UNDO_SECS,
+                "title": p["title"],
+            }
+            cell = self._cell_by_hwnd.get(hwnd)
+            if cell:
+                try:
+                    cell.configure(highlightbackground="#aa3333",
+                                   highlightthickness=2)
+                except Exception:
+                    pass
+            log(f"close ARMED for '{p['title']}' - "
+                f"undo within {CLOSE_UNDO_SECS}s (right-click / left-click)")
+
+    def _cancel_close(self, hwnd, why):
+        pend = self._pending_close.pop(hwnd, None)
+        if not pend:
+            return
+        cell = self._cell_by_hwnd.get(hwnd)
+        if cell:
+            try:
+                cell.configure(highlightbackground="#333333",
+                               highlightthickness=1)
+            except Exception:
+                pass
+        log(f"close CANCELLED for '{pend['title']}' ({why})")
+
+    def _fire_close(self, hwnd):
+        pend = self._pending_close.pop(hwnd, None)
+        if not pend:
+            return
+        with self.lock:
+            p = self.parked.get(hwnd)
+        # hwnd reuse guard: only close it if it's still the same window
+        if not p or p["title"] != pend["title"] or not is_alive(hwnd):
+            log(f"close for '{pend['title']}' skipped - window already gone")
+            return
         try:
             win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
-            log(f"CLOSE requested for '{p['title']}'")
+            log(f"CLOSED '{pend['title']}' (undo expired)")
         except Exception as e:
-            log(f"could not close '{p['title']}': {e}")
+            log(f"could not close '{pend['title']}': {e}")
 
     def sweep_dead(self):
         """Forget parked windows the user closed; delete their pictures."""
+        for hwnd in [h for h in self._pending_close if not is_alive(h)]:
+            self._pending_close.pop(hwnd, None)
+            log("close disarmed - window died on its own")
         gone = []
         with self.lock:
             for h in list(self.parked):
@@ -811,14 +859,14 @@ class Foculet:
     def start_tray(self):
         self._app_name = self.root.title() or "Valet"
         t = threading.Thread(target=self._tray_main, daemon=True,
-                             name="valet-tray")
+                             name="foculet-tray")
         t.start()
 
     # -- picture board (runs on the main/Tk thread) ------------------
 
     def build_lot(self):
         self.root = tk.Tk()
-        self.root.title("Foculet")
+        self.root.title("Valet")
         self.root.configure(bg="#141414")
         self.root.overrideredirect(True)  # borderless: just the board
         wl, wt, wr, wb = self.dump["work"]
@@ -832,7 +880,9 @@ class Foculet:
         self._lot_key = None
         self._lot_age_key = None
         self._photos = []
-        self._badge_widgets = []
+        self._badge_widgets = []  # (hwnd, badge label, parked_at)
+        self._cell_by_hwnd = {}   # hwnd -> cell frame (for close-arm tint)
+        self._pending_close = {}  # hwnd -> {"deadline", "title"}
         self.root.withdraw()  # hidden until the first window parks
         try:
             # the board must never steal focus: deiconify() can activate
@@ -850,7 +900,8 @@ class Foculet:
         for w in self.grid_frame.winfo_children():
             w.destroy()
         self._photos = []
-        self._badge_widgets = []  # (badge label, parked_at): ticked in place
+        self._badge_widgets = []  # (hwnd, badge label, parked_at): ticked in place
+        self._cell_by_hwnd = {}
         for i in range(self.max_parked):
             cell = tk.Frame(self.grid_frame, bg="#1e1e1e",
                             highlightbackground="#333333", highlightthickness=1)
@@ -879,7 +930,12 @@ class Foculet:
                 badge = tk.Label(cell, text=age_txt, fg=age_fg, bg="#101010",
                                  font=("Segoe UI", 8), padx=4, pady=1)
                 badge.place(relx=1.0, rely=0.0, anchor="ne", x=-4, y=4)
-                self._badge_widgets.append((badge, parked_at))
+                self._badge_widgets.append((hwnd, badge, parked_at))
+                self._cell_by_hwnd[hwnd] = cell
+                if hwnd in self._pending_close:
+                    # rebuild kept an armed close: re-tint the new cell
+                    cell.configure(highlightbackground="#aa3333",
+                                   highlightthickness=2)
                 name = (title[:34] + "…") if len(title) > 34 else title
                 tl = tk.Label(cell, text=name or "(no title)", fg="#bbbbbb",
                               bg="#1e1e1e", font=("Segoe UI", 9),
@@ -893,12 +949,24 @@ class Foculet:
                           lambda e, h=hwnd: self.close_parked(h))
 
     def _tick_badges(self, now):
-        for badge, pa in getattr(self, "_badge_widgets", []):
+        expired = []
+        for hwnd, badge, pa in getattr(self, "_badge_widgets", []):
             try:
-                txt, fg = age_badge(now - pa)
-                badge.configure(text=txt, fg=fg)
+                pend = self._pending_close.get(hwnd)
+                if pend:
+                    left = pend["deadline"] - now
+                    if left <= 0:
+                        expired.append(hwnd)
+                    else:
+                        badge.configure(text=f"\u2715 {math.ceil(left)}s",
+                                        fg="#ff6666")
+                else:
+                    txt, fg = age_badge(now - pa)
+                    badge.configure(text=txt, fg=fg)
             except Exception:
                 pass
+        for hwnd in expired:
+            self._fire_close(hwnd)
 
     def refresh_lot(self):
         try:
@@ -926,7 +994,7 @@ class Foculet:
                 self._lot_key = id_key
                 self._lot_age_key = age_key
                 log(f"board: {len(items)} picture(s)")
-            elif age_key != self._lot_age_key:
+            elif age_key != self._lot_age_key or self._pending_close:
                 self._tick_badges(now)
                 self._lot_age_key = age_key
             hwnd = self._tray_hwnd
@@ -1159,7 +1227,7 @@ class Foculet:
                         f"{val!r}\n")
                 traceback.print_exception(exc, val, tb, file=f)
                 f.write("\n")
-            log(f"CRASH (tk callback): {val!r} -- see valet-crash.log")
+            log(f"CRASH (tk callback): {val!r} -- see foculet-crash.log")
         except Exception:
             pass
 
@@ -1192,7 +1260,7 @@ def save_config(path, cfg):
 def main():
     _install_crash_handlers()
     ap = argparse.ArgumentParser(
-        description="Foculet - parks your previous window on the dump monitor")
+        description="Valet - parks your previous window on the dump monitor")
     ap.add_argument("--dump", default=None,
                     help="rightmost | primary | <index> | <device name>")
     ap.add_argument("--config", default=os.path.join(HERE, "foculet.json"))
@@ -1212,9 +1280,9 @@ def main():
         save_config(args.config, cfg)
         log(f"dump monitor chosen: {dump} (board {grid_cols}x{grid_rows})")
 
-    app = Foculet(dump, cfg["excluded_exes"], grid_cols, grid_rows)
+    foculet = Valet(dump, cfg["excluded_exes"], grid_cols, grid_rows)
     try:
-        app.run()
+        foculet.run()
     except KeyboardInterrupt:
         log("stopped.")
 
@@ -1231,7 +1299,7 @@ if __name__ == "__main__":
         except Exception:
             pass
         try:
-            log("CRASH (startup): see valet-crash.log")
+            log("CRASH (startup): see foculet-crash.log")
         except Exception:
             pass
         sys.exit(1)
