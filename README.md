@@ -53,7 +53,7 @@ state and sends it detach/close commands.
 ## Requirements
 
 - Windows 10 or 11
-- Python 3.10+ with `pywin32`, `Pillow`, and `pystray` (`pip install pywin32 pillow pystray`)
+- Python 3.10+ with `pywin32` and `Pillow` (`pip install pywin32 pillow`)
 - Google Chrome (only needed for tab parking; the window parker works alone)
 
 ## Install
@@ -61,7 +61,7 @@ state and sends it detach/close commands.
 ```powershell
 git clone https://github.com/dt-memyrlabs/foculet.git
 cd foculet
-pip install pywin32 pillow pystray
+pip install pywin32 pillow
 
 # 1. Bridge server (leave running) — lets the extension talk to Foculet
 python bridge-server.py
