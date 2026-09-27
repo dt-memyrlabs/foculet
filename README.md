@@ -24,8 +24,11 @@ Your dump monitor is sacred ground: a live parking lot, not a workspace.
    that turns amber after 15 minutes and orange-red after an hour.
 4. **Restore.** Click a picture (or its title, or its cell) and the real
    window un-minimizes back to its original monitor, position, size, and
-   maximized state. Right-click a picture to close the real window instead —
-   Foculet notices it's gone and drops the picture.
+   maximized state. Right-click a picture to close the real window — but it
+   doesn't close right away: the click *arms* a close and the cell shows a
+   red 20-second countdown. Right-click again or left-click (restore) to
+   cancel; when the timer expires the window closes for real, and Foculet
+   notices it's gone and drops the picture.
 5. **Glance protection.** A parked window that briefly becomes foreground
    (Alt+Tab preview, taskbar hover peek, an app raising itself for a moment)
    stays parked unless it holds focus for a full second.
