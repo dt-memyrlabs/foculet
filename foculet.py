@@ -267,10 +267,16 @@ def is_owned(hwnd):
         return False
 
 
-# hosts of transient shell UI: tray overflow, Start menu, search,
-# notification center, quick settings...
+# Hosts of transient system UI: tray overflow, Start menu, search,
+# notification center, quick settings, credential/PIN prompts
+# (Windows Hello), touch keyboard, emoji picker / clipboard history,
+# UAC, OOBE, lock screen. These pop OVER your work; focusing one is
+# never a real task switch, so the window behind it must not be parked.
 _SHELL_HOSTS = {"explorer.exe", "startmenuexperiencehost.exe",
-                "searchhost.exe", "shellexperiencehost.exe"}
+                "searchhost.exe", "shellexperiencehost.exe",
+                "credentialuibroker.exe", "tabtip.exe",
+                "textinputhost.exe", "consent.exe",
+                "useroobebroker.exe", "lockapp.exe", "sihost.exe"}
 
 
 def _class_name(hwnd):
