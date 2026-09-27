@@ -20,7 +20,8 @@ Your dump monitor is sacred ground: a live parking lot, not a workspace.
 3. **The board.** A borderless Tkinter window covering the dump monitor,
    showing parked windows oldest-first in a configurable grid. Hidden when
    empty, always at the bottom of the z-order, and it can never steal
-   keyboard focus.
+   keyboard focus. Each picture carries an age badge (`<1m`, `5m`, `2h`)
+   that turns amber after 15 minutes and orange-red after an hour.
 4. **Restore.** Click a picture (or its title, or its cell) and the real
    window un-minimizes back to its original monitor, position, size, and
    maximized state. Right-click a picture to close the real window instead —
@@ -101,6 +102,11 @@ Delete `foculet.json` to re-run first-time setup.
   notification center, and volume/network flyouts are invisible to the
   watcher: opening them neither parks your current window nor parks
   themselves. (Explorer *file* windows still park normally.)
+- **System prompts that pop over your work.** Windows Hello PIN/credential
+  dialogs, the touch keyboard, the emoji picker, UAC prompts — focusing one
+  is never a task switch, so the window behind it stays put.
+- **Foculet's own tray icon.** Clicking it (or its menu) never disturbs
+  your windows.
 - **The dump monitor.** Windows already on the board's monitor are left alone.
 - **Excluded apps**, the Foculet console, and windows without titles.
 - **Board capacity.** When the grid is full, further parks are skipped
@@ -134,6 +140,16 @@ Three guards break the loop:
 
 Everything is local. The only network traffic is the extension talking to
 `127.0.0.1:18721` on your own machine. No accounts, no cloud, no telemetry.
+
+## Debugging
+
+Foculet runs windowless, so a dying thread would vanish without a trace.
+Two logs sit next to `foculet.py`:
+
+- `foculet.log` — timestamped event log: parks, unparks, skips (with
+  reasons), tray and bridge status.
+- `foculet-crash.log` — full tracebacks from every thread, the main loop,
+  and hard crashes.
 
 ## Limitations
 
