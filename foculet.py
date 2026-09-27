@@ -80,6 +80,47 @@ def log(msg):
         pass
 
 
+CRASH_PATH = os.path.join(HERE, "valet-crash.log")
+_crash_fh = None  # held open for faulthandler; see _install_crash_handlers
+
+
+def _install_crash_handlers():
+    """Log every otherwise-silent death to valet-crash.log.
+
+    Under pythonw there is no console, so an unhandled exception in the
+    watcher thread, the tray thread, or a Tk callback would vanish
+    without a trace and the app would just look "crashed". This routes
+    all of them (plus faulthandler for hard crashes) into a file.
+    """
+    global _crash_fh
+    import faulthandler
+    _crash_fh = open(CRASH_PATH, "a", encoding="utf-8", buffering=1)
+    _crash_fh.write(f"\n=== valet started pid={os.getpid()} "
+                    f"at {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+    faulthandler.enable(file=_crash_fh)
+
+    def _write(kind, exc):
+        try:
+            _crash_fh.write(f"[{time.strftime('%H:%M:%S')}] {kind}: "
+                            f"{exc!r}\n")
+            traceback.print_exception(type(exc), exc, exc.__traceback__,
+                                      file=_crash_fh)
+            _crash_fh.write("\n")
+        except Exception:
+            pass
+        log(f"CRASH ({kind}): {exc!r} -- full traceback in valet-crash.log")
+
+    def _excepthook(typ, val, tb):
+        _write("main thread", val)
+
+    def _thread_excepthook(args):
+        name = args.thread.name if args.thread else "?"
+        _write(f"thread {name}", args.exc_value)
+
+    sys.excepthook = _excepthook
+    threading.excepthook = _thread_excepthook
+
+
 # ---------------------------------------------------------------- monitors
 
 def list_monitors():
@@ -619,34 +660,46 @@ class Foculet:
     _TRAY_ID_EXIT = 1002
 
     def _make_tray_hicon(self):
-        """Build the amber .ico next to the script; return an HICON."""
-        here = os.path.dirname(os.path.abspath(__file__))
-        path = os.path.join(here, "tray.ico")
+        """Build the amber icon directly as an HICON (32-bit color +
+        1-bit mask). No .ico file involved, so Windows can't misread it."""
+        import struct
+        from PIL import ImageFont
         try:
-            from PIL import ImageFont
-            letter = (self.root.title() or "V")[0].upper()
-            img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+            size = 32
+            letter = (self._app_name or "V")[0].upper()
+            img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
             d = ImageDraw.Draw(img)
-            d.rounded_rectangle([4, 4, 60, 60], radius=14,
+            d.rounded_rectangle([2, 2, size - 3, size - 3], radius=7,
                                 fill=(217, 154, 43, 255))
             try:
-                font = ImageFont.truetype("segoeui.ttf", 38)
+                font = ImageFont.truetype("segoeui.ttf", 20)
             except Exception:
                 font = ImageFont.load_default()
-            d.text((32, 34), letter, fill=(20, 20, 20, 255),
-                   font=font, anchor="mm")
-            img.resize((32, 32), Image.LANCZOS).save(path, format="ICO")
+            d.text((size // 2, size // 2 + 1), letter,
+                   fill=(20, 20, 20, 255), font=font, anchor="mm")
+            px = img.load()
+            xor = bytearray()
+            mask = bytearray()
+            for y in range(size - 1, -1, -1):  # BMP rows are bottom-up
+                dword = 0
+                for x in range(size):
+                    r, g, b, a = px[x, y]
+                    xor += bytes((b, g, r, a))
+                    if a < 128:  # AND mask: 1 bit = transparent
+                        dword |= (1 << (31 - x))
+                mask += struct.pack("<I", dword)
+            gdi32 = ctypes.windll.gdi32
+            hxor = gdi32.CreateBitmap(size, size, 1, 32, bytes(xor))
+            hmask = gdi32.CreateBitmap(size, size, 1, 1, bytes(mask))
+            hicon = win32gui.CreateIconIndirect((True, 0, 0, hxor, hmask))
+            log(f"tray icon built: hicon={hicon}")
+            return hicon
         except Exception as e:
-            log(f"tray icon build failed: {e}")
-        try:
-            return win32gui.LoadImage(0, path, win32con.IMAGE_ICON,
-                                      0, 0, win32con.LR_LOADFROMFILE)
-        except Exception as e:
-            log(f"tray icon load failed ({e}); using stock icon")
+            log(f"tray icon build failed ({e}); using stock icon")
             return win32gui.LoadIcon(0, win32con.IDI_APPLICATION)
 
     def _show_tray_menu(self, hwnd):
-        name = self.root.title() or "Valet"
+        name = self._app_name
         with self.lock:
             n = len(self.parked)
         menu = win32gui.CreatePopupMenu()
@@ -671,6 +724,20 @@ class Foculet:
 
     def _tray_wndproc(self, hwnd, msg, wparam, lparam):
         WM_TRAY = win32con.WM_USER + 20
+        if msg == self._wm_taskbarcreated:
+            # Explorer was restarted: our icon registration died with it.
+            # Re-add the icon so it comes back on its own.
+            try:
+                win32gui.Shell_NotifyIcon(
+                    win32gui.NIM_ADD,
+                    (hwnd, 0,
+                     win32gui.NIF_ICON | win32gui.NIF_MESSAGE
+                     | win32gui.NIF_TIP,
+                     WM_TRAY, self._tray_hicon, self._app_name))
+                log("tray icon re-registered after explorer restart")
+            except Exception as e:
+                log(f"tray icon re-register failed: {e}")
+            return 0
         if msg == WM_TRAY:
             if lparam in (win32con.WM_LBUTTONUP, win32con.WM_RBUTTONUP):
                 self._show_tray_menu(hwnd)
@@ -704,8 +771,11 @@ class Foculet:
 
     def _tray_main(self):
         WM_TRAY = win32con.WM_USER + 20
-        name = self.root.title() or "Valet"
+        name = self._app_name
         hicon = self._make_tray_hicon()
+        self._tray_hicon = hicon
+        self._wm_taskbarcreated = win32gui.RegisterWindowMessage(
+            "TaskbarCreated")
         wc = win32gui.WNDCLASS()
         wc.lpfnWndProc = self._tray_wndproc
         wc.lpszClassName = "ValetTrayWindow"
@@ -730,6 +800,7 @@ class Foculet:
         self._tray_hwnd = None
 
     def start_tray(self):
+        self._app_name = self.root.title() or "Valet"
         t = threading.Thread(target=self._tray_main, daemon=True,
                              name="valet-tray")
         t.start()
@@ -1051,8 +1122,20 @@ class Foculet:
         finally:
             self._tab_op.clear()
 
+    def _tk_crash(self, exc, val, tb):
+        try:
+            with open(CRASH_PATH, "a", encoding="utf-8") as f:
+                f.write(f"[{time.strftime('%H:%M:%S')}] tk callback: "
+                        f"{val!r}\n")
+                traceback.print_exception(exc, val, tb, file=f)
+                f.write("\n")
+            log(f"CRASH (tk callback): {val!r} -- see valet-crash.log")
+        except Exception:
+            pass
+
     def run(self):
         self.build_lot()
+        self.root.report_callback_exception = self._tk_crash
         self.start_tray()  # needs root (for the title); runs its own thread
         t = threading.Thread(target=self.watcher, daemon=True,
                              name="foculet-watcher")
@@ -1077,6 +1160,7 @@ def save_config(path, cfg):
 
 
 def main():
+    _install_crash_handlers()
     ap = argparse.ArgumentParser(
         description="Foculet - parks your previous window on the dump monitor")
     ap.add_argument("--dump", default=None,
@@ -1109,5 +1193,15 @@ if __name__ == "__main__":
     try:
         main()
     except Exception:
-        traceback.print_exc()
+        try:
+            with open(CRASH_PATH, "a", encoding="utf-8") as f:
+                f.write(f"[{time.strftime('%H:%M:%S')}] startup/main "
+                        f"crashed\n")
+                traceback.print_exc(file=f)
+        except Exception:
+            pass
+        try:
+            log("CRASH (startup): see valet-crash.log")
+        except Exception:
+            pass
         sys.exit(1)
