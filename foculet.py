@@ -434,6 +434,9 @@ class Foculet:
         self._quiet_until = 0.0  # focus changes before this are ours
                                  # (minimize/restore); the watcher absorbs
                                  # them instead of treating them as switches
+        self._paused = threading.Event()  # set from the tray menu: parking
+                                          # halts until resumed
+        self._tray = None  # pystray icon, once start_tray() builds it
         self.parked = {}  # hwnd -> {"origin_rect", "origin_device", "exe",
                           #          "title", "thumb", "was_maximized"}
         self.current = {}  # monitor device -> hwnd currently owning that screen
@@ -568,6 +571,68 @@ class Foculet:
         with self.lock:
             return set(self.parked)
 
+    # -- system tray (runs on its own thread; no console window needed) ---
+
+    def _tray_image(self):
+        from PIL import ImageFont
+        letter = (self.root.title() or "F")[0].upper()
+        img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        d.rounded_rectangle([4, 4, 60, 60], radius=14, fill=(217, 154, 43))
+        try:
+            font = ImageFont.truetype("segoeui.ttf", 38)
+        except Exception:
+            font = ImageFont.load_default()
+        d.text((32, 34), letter, fill=(20, 20, 20), font=font, anchor="mm")
+        return img
+
+    def start_tray(self):
+        try:
+            import pystray
+        except ImportError:
+            log("pystray not installed: no tray icon "
+                "(pip install pystray to get one)")
+            return
+        name = self.root.title() or "Foculet"
+
+        def parked_label(item):
+            with self.lock:
+                n = len(self.parked)
+            return f"{n} parked" if n != 1 else "1 parked"
+
+        def pause_label(item):
+            return "Resume parking" if self._paused.is_set() \
+                else "Pause parking"
+
+        def toggle_pause(icon, item):
+            if self._paused.is_set():
+                self._paused.clear()
+                log("parking resumed from tray")
+            else:
+                self._paused.set()
+                log("parking paused from tray")
+
+        def do_exit(icon, item):
+            log("exit requested from tray")
+            try:
+                icon.stop()  # remove the icon; thread ends
+            finally:
+                # Tk must die on its own thread
+                self.root.after(0, self.root.destroy)
+
+        menu = pystray.Menu(
+            pystray.MenuItem(name, lambda i, _: None, enabled=False),
+            pystray.MenuItem(parked_label, lambda i, _: None, enabled=False),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem(pause_label, toggle_pause),
+            pystray.MenuItem("Exit", do_exit),
+        )
+        self._tray = pystray.Icon(name, self._tray_image(), name, menu)
+        t = threading.Thread(target=self._tray.run, daemon=True,
+                             name="foculet-tray")
+        t.start()
+        log("tray icon running")
+
     # -- picture board (runs on the main/Tk thread) ------------------
 
     def build_lot(self):
@@ -665,6 +730,14 @@ class Foculet:
                 # freezing the board on stale/empty cells
                 self._lot_key = key
                 log(f"board: {len(items)} picture(s)")
+            if self._tray is not None:
+                try:
+                    n = len(items)
+                    self._tray.title = \
+                        f"{self.root.title()} - {n} parked" if n != 1 else \
+                        f"{self.root.title()} - 1 parked"
+                except Exception:
+                    pass
         except Exception as e:
             log(f"lot refresh failed: {e}")
         self.root.after(500, self.refresh_lot)
@@ -690,7 +763,8 @@ class Foculet:
                 # is what used to cascade: park -> focus jump -> park...)
                 with self.lock:
                     quiet = time.time() < self._quiet_until
-                if not self._tab_op.is_set() and not quiet:
+                paused = self._paused.is_set()
+                if not self._tab_op.is_set() and not quiet and not paused:
                     self.on_fg_change(fg)
                 prev = fg
 
@@ -800,6 +874,10 @@ class Foculet:
             if prev is None or prev == tid \
                     or not any(t["id"] == prev for t in tabs):
                 last_active[wid] = tid
+            elif self._paused.is_set():
+                # paused from the tray: track the tab so resume doesn't
+                # tear off a stale one, but don't park anything
+                last_active[wid] = tid
             elif self.tear_off_tab(fwin, prev):
                 last_active[wid] = tid
             # else: detach failed; keep prev so the next poll retries it
@@ -870,6 +948,7 @@ class Foculet:
 
     def run(self):
         self.build_lot()
+        self.start_tray()  # needs root (for the title); runs its own thread
         t = threading.Thread(target=self.watcher, daemon=True,
                              name="foculet-watcher")
         t.start()
