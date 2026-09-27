@@ -320,35 +320,38 @@ def age_badge(age_s):
 
 def parkable(hwnd, dump_device, excluded_exes):
     """True if this window is eligible to be parked right now."""
+    def no(why):
+        log(f"skip '{safe_title(hwnd)}': {why}")
+        return False
     if hwnd == OWN_CONSOLE:
         return False
     try:
         if not win32gui.IsWindow(hwnd) or not win32gui.IsWindowVisible(hwnd):
-            return False
+            return no("not a live/visible window")
         if win32gui.IsIconic(hwnd):
-            return False
+            return no("already minimized")
         if win32gui.GetParent(hwnd):          # not a top-level window
-            return False
+            return no("not top-level")
         if is_owned(hwnd):                    # a dialog/popup: belongs to
-            return False                      # its owner, never parked alone
+            return no("owned dialog/popup")   # its owner, never parked alone
         if is_shell_transient(hwnd):          # tray overflow, Start menu,
-            return False                      # flyouts: not real windows
+            return no("transient shell UI")   # flyouts: not real windows
     except Exception:
         return False
     title = safe_title(hwnd)
     if not title or title == "Program Manager":
-        return False
+        return no("no title")
     if exe_of(hwnd) in excluded_exes:
-        return False
+        return no("in excluded_exes")
     try:
         rect = win32gui.GetWindowRect(hwnd)
     except Exception:
-        return False
+        return no("no rect")
     if is_fullscreen(hwnd, rect):
-        return False                          # never yank a fullscreen app/game
+        return no("fullscreen (never yank a fullscreen app/game)")
     mon = monitor_from_rect(rect)
     if mon and mon["device"] == dump_device:
-        return False                          # already on the dump monitor
+        return no("already on the dump monitor")
     return True
 
 
