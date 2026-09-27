@@ -1,0 +1,7 @@
+# Foculet runtime files (generated on first run / while running)
+foculet.json
+foculet.log
+foculet.err.log
+thumbs/
+__pycache__/
+*.pyc
