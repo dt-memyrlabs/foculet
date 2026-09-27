@@ -950,9 +950,12 @@ class Foculet:
         # each screen remembers its current window; the moment you
         # focus a new window on a screen, that screen's previous
         # window gets its picture taken and is parked on the board.
-        if fg and (is_owned(fg) or is_shell_transient(fg)):
+        if fg and (is_owned(fg) or is_shell_transient(fg)
+                   or fg == getattr(self, "_tray_hwnd", None)):
             return  # a dialog/popup opened (file picker, save dialog),
-                    # or transient shell UI (tray overflow, Start menu):
+                    # transient shell UI (tray overflow, Start menu),
+                    # or our own tray window (its menu steals focus
+                    # via SetForegroundWindow when you click the icon):
                     # not a real switch - leave everything alone
         if fg in self.parked_keys():
             # A parked window became foreground. That can be a deliberate
