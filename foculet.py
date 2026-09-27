@@ -830,7 +830,9 @@ class Foculet:
         for r in range(self.grid_rows):
             self.grid_frame.grid_rowconfigure(r, weight=1, uniform="cell")
         self._lot_key = None
+        self._lot_age_key = None
         self._photos = []
+        self._badge_widgets = []
         self.root.withdraw()  # hidden until the first window parks
         try:
             # the board must never steal focus: deiconify() can activate
@@ -848,6 +850,7 @@ class Foculet:
         for w in self.grid_frame.winfo_children():
             w.destroy()
         self._photos = []
+        self._badge_widgets = []  # (badge label, parked_at): ticked in place
         for i in range(self.max_parked):
             cell = tk.Frame(self.grid_frame, bg="#1e1e1e",
                             highlightbackground="#333333", highlightthickness=1)
@@ -876,6 +879,7 @@ class Foculet:
                 badge = tk.Label(cell, text=age_txt, fg=age_fg, bg="#101010",
                                  font=("Segoe UI", 8), padx=4, pady=1)
                 badge.place(relx=1.0, rely=0.0, anchor="ne", x=-4, y=4)
+                self._badge_widgets.append((badge, parked_at))
                 name = (title[:34] + "…") if len(title) > 34 else title
                 tl = tk.Label(cell, text=name or "(no title)", fg="#bbbbbb",
                               bg="#1e1e1e", font=("Segoe UI", 9),
@@ -888,6 +892,14 @@ class Foculet:
                 cell.bind("<Button-3>",
                           lambda e, h=hwnd: self.close_parked(h))
 
+    def _tick_badges(self, now):
+        for badge, pa in getattr(self, "_badge_widgets", []):
+            try:
+                txt, fg = age_badge(now - pa)
+                badge.configure(text=txt, fg=fg)
+            except Exception:
+                pass
+
     def refresh_lot(self):
         try:
             with self.lock:
@@ -897,9 +909,11 @@ class Foculet:
                                  key=lambda kv: kv[1].get("parked_at", 0))
                 items = [(h, p["title"], p["thumb"], p.get("parked_at", now))
                          for h, p in ordered if is_alive(h)]
-            # key includes the age minute-bucket so badges tick over
-            key = tuple((h, int((now - pa) // 60)) for h, _, _, pa in items)
-            if key != self._lot_key:
+            # identity key: full rebuild only when the parked SET
+            # changes. Age badges tick in place (no rebuild, no blink).
+            id_key = tuple(h for h, _, _, _ in items)
+            age_key = tuple(int((now - pa) // 60) for _, _, _, pa in items)
+            if id_key != self._lot_key:
                 if items:
                     self.root.deiconify()
                     self.root.lower()  # stay at the bottom of the z-order
@@ -909,8 +923,12 @@ class Foculet:
                 # advance the key only after a successful build, so a
                 # failed render retries on the next tick instead of
                 # freezing the board on stale/empty cells
-                self._lot_key = key
+                self._lot_key = id_key
+                self._lot_age_key = age_key
                 log(f"board: {len(items)} picture(s)")
+            elif age_key != self._lot_age_key:
+                self._tick_badges(now)
+                self._lot_age_key = age_key
             hwnd = self._tray_hwnd
             if hwnd:
                 try:
