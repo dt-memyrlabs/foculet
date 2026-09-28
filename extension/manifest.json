@@ -1,1 +1,1 @@
-{"background":{"service_worker":"background.js"},"description":"Lets Foculet watch Chrome tabs and tear background tabs into their own windows for parking.","host_permissions":["http://127.0.0.1:18721/*"],"manifest_version":3,"name":"Foculet Bridge","permissions":["tabs","alarms"],"version":"1.0"}
+{"background":{"service_worker":"background.js"},"description":"Lets Foculet tear off Chrome tabs into parked windows on the dump monitor.","host_permissions":["http://127.0.0.1:18722/*"],"manifest_version":3,"name":"Foculet Bridge","permissions":["tabs","alarms"],"version":"1.8"}
