@@ -14,43 +14,30 @@ Your dump monitor is sacred ground: a live parking lot, not a workspace.
 1. **Focus watcher** (background thread, polls every 0.5s). Each monitor
    remembers its *current* window. When a new window takes focus on a
    monitor, that monitor's previous window is eligible for parking.
-   Minimizing a window counts as switching away: it parks too.
-2. **Park.** Foculet snapshots the window (`PrintWindow` — works even for
-   windows behind other windows), minimizes the real window, and pins the
-   snapshot to the board.
+2. **Park.** Foculet takes the window's picture, minimizes the real window,
+   and pins the picture to the board. The picture comes from a snapshot
+   taken while the window was focused — a straight screen copy (~10ms, the
+   app never stutters) — so switching never freezes what you're doing.
+   Minimizing a window parks it the same way.
 3. **The board.** A borderless Tkinter window covering the dump monitor,
    showing parked windows oldest-first in a configurable grid. Hidden when
    empty, always at the bottom of the z-order, and it can never steal
-   keyboard focus. Each picture carries an age badge (`<1m`, `5m`, `2h`)
-   that turns amber after 15 minutes and orange-red after an hour.
-4. **Restore.** Click a picture (or its title, or its cell) and the real
-   window un-minimizes back to its original monitor, position, size, and
-   maximized state. Right-click a picture to close the real window — but it
-   doesn't close right away: the click *arms* a close and the cell shows a
-   red 20-second countdown. Right-click again or left-click (restore) to
-   cancel; when the timer expires the window closes for real, and Foculet
-   notices it's gone and drops the picture.
+   keyboard focus. The grid auto-grows (3×2 → 3×3 → 4×3) before it starts
+   refusing new parks.
+4. **Restore.** Click a picture and the real window un-minimizes back to its
+   original monitor, position, size, and maximized state. Right-click a
+   picture to close the real window instead — Foculet notices it's gone and
+   drops the picture. Right-click again (or left-click) within 20 seconds to
+   undo the close.
 5. **Glance protection.** A parked window that briefly becomes foreground
    (Alt+Tab preview, taskbar hover peek, an app raising itself for a moment)
    stays parked unless it holds focus for a full second.
-
-### Chrome tabs
-
-A Chrome extension watches tab switches in the focused Chrome window. When
-you move to a new tab, the previous tab is *torn off* into its own window
-(`chrome.windows.create({tabId})`) and parked through the normal flow.
-Restoring brings the window back — it is not re-attached to the original
-window. The extension talks to a tiny bridge server built into Foculet
-itself (HTTP on `127.0.0.1:18722`, localhost only); Foculet polls it for
-tab state and sends it detach commands.
 
 ## Components
 
 | File | What it is |
 |---|---|
-| `foculet.py` | The whole app: watcher, parker, board, tab logic, Chrome bridge server |
-| `extension/background.js` | Chrome extension service worker: tab watcher, tab tear-off |
-| `extension/manifest.json` | Extension manifest (Manifest V3) |
+| `foculet.py` | The whole app: watcher, parker, board, tray icon |
 | `ctl.ps1` | `status` / `stop` / `start` control script for Windows |
 | `foculet.json` | Config, created on first run (dump monitor, grid, exclusions) |
 
@@ -58,7 +45,6 @@ tab state and sends it detach commands.
 
 - Windows 10 or 11
 - Python 3.10+ with `pywin32` and `Pillow` (`pip install pywin32 pillow`)
-- Google Chrome (only needed for tab parking; the window parker works alone)
 
 ## Install
 
@@ -67,21 +53,15 @@ git clone https://github.com/dt-memyrlabs/foculet.git
 cd foculet
 pip install pywin32 pillow
 
-# 1. Chrome extension — chrome://extensions → Developer mode →
-#    "Load unpacked" → select the extension/ folder
-#    (leave any other extensions alone)
-
-# 2. Foculet itself (no console window - it lives in the system tray)
+# Foculet itself (no console window - it lives in the system tray)
 .\ctl.ps1 -Action start
 ```
 
 The tray icon (bottom-right) shows the parked count, and its menu has
-Pause parking / Resume parking and Exit. Right-click it anytime.
+Pause parking / Resume parking and Exit.
 
-On first run Foculet walks you through a short setup: what it does, which
-monitor is the dump (plus board grid size), and the extension install with
-a connection test. Everything is saved to `foculet.json`. Re-run it anytime
-from the tray menu: **Setup…** — switching the dump monitor applies live.
+On first run Foculet shows a small monitor picker if it can't tell which
+monitor is the dump — pick one and it's saved to `foculet.json`.
 
 `.\ctl.ps1 -Action status` checks it's running; `-Action stop` kills it.
 
@@ -92,7 +72,7 @@ from the tray menu: **Setup…** — switching the dump monitor applies live.
 | `dump_device` | Monitor that hosts the board (`\\.\DISPLAY2`…) | chosen at first run |
 | `grid_cols` / `grid_rows` | Board grid, 1–8 each; board capacity = cols × rows | 3 × 2 |
 | `excluded_exes` | Process names (e.g. `notepad.exe`) that are never parked | `[]` |
-| `never_park` | App names (e.g. `WhatsApp`) that are never parked | `[]` |
+| `never_park` | Window titles that are never parked (e.g. messaging apps) | `[]` |
 
 Delete `foculet.json` to re-run first-time setup.
 
@@ -106,15 +86,11 @@ Delete `foculet.json` to re-run first-time setup.
   notification center, and volume/network flyouts are invisible to the
   watcher: opening them neither parks your current window nor parks
   themselves. (Explorer *file* windows still park normally.)
-- **System prompts that pop over your work.** Windows Hello PIN/credential
-  dialogs, the touch keyboard, the emoji picker, UAC prompts — focusing one
-  is never a task switch, so the window behind it stays put.
-- **Foculet's own tray icon.** Clicking it (or its menu) never disturbs
-  your windows.
 - **The dump monitor.** Windows already on the board's monitor are left alone.
 - **Excluded apps**, the Foculet console, and windows without titles.
-- **Board capacity.** When the grid is full, further parks are skipped
-  (oldest-parked-first ordering keeps the board a readable timeline).
+- **Board capacity.** When the grid is full (after auto-growing through
+  3×2 → 3×3 → 4×3), further parks are skipped (oldest-parked-first ordering
+  keeps the board a readable timeline).
 
 ## Anti-cascade design
 
@@ -142,49 +118,27 @@ Three guards break the loop:
 
 ## Privacy
 
-Everything is local. The only network traffic is the extension talking to
-`127.0.0.1:18721` on your own machine. No accounts, no cloud, no telemetry.
-
-## Debugging
-
-Foculet runs windowless, so a dying thread would vanish without a trace.
-Two logs sit next to `foculet.py`:
-
-- `foculet.log` — timestamped event log: parks, unparks, skips (with
-  reasons), tray and bridge status.
-- `foculet-crash.log` — full tracebacks from every thread, the main loop,
-  and hard crashes.
+Everything is local. No network traffic at all — no accounts, no cloud, no
+telemetry.
 
 ## Limitations
 
-- Board pictures are snapshots, not live views.
+- Board pictures are snapshots, not live views (refreshed every ~30s while
+  a window is focused).
 - A very fast switch inside the 1.5s quiet window won't park the window you
   left (fail-open, by design).
-- Windows only. Chrome tab parking needs the extension + bridge server
-  running; without them, Foculet still parks whole Chrome windows.
-- Minimized windows with a modal dialog open can confuse Windows' focus
-  bookkeeping — the owned-window guard keeps Foculet out of the way, but the
-  OS may still shuffle z-order.
+- Windows only.
 
 ## Project layout
 
 ```
 foculet/
 ├── foculet.py            # the app
-├── bridge-server.py      # localhost bridge for the extension
-├── extension/
-│   ├── manifest.json
-│   └── background.js
 ├── ctl.ps1               # status | stop | start
 ├── foculet.json          # created on first run
 ├── README.md
 └── LICENSE               # MIT
 ```
-
-## Sponsor
-
-Foculet is free and open source. If it saves your attention, sponsoring it
-tells us how many people it helps — and keeps the core free forever.
 
 ## License
 
