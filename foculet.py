@@ -4,7 +4,7 @@ Foculet - a Windows focus-parking app.
 
 The loop:
   * every time you switch to a new window on a screen, that screen's
-    previous window is "parked": Valet snaps a thumbnail picture of it,
+    previous window is "parked": Foculet snaps a thumbnail picture of it,
     minimizes the real window, and pins the picture to the board on
     the dump monitor - a giant taskbar of pictures of what you were doing
   * click a picture -> the real window restores to the monitor it came from
@@ -22,12 +22,15 @@ import ctypes
 import json
 import math
 import os
+import shutil
 import sys
 import threading
 import time
 import traceback
 import tkinter as tk
 import urllib.request
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from PIL import Image, ImageTk, ImageDraw
 
@@ -62,6 +65,10 @@ POLL_SECS = 0.5
 CLOSE_UNDO_SECS = 20  # right-click arms a close; undo window
 GRID_COLS = 3            # default board grid; Daniel can change it in
 GRID_ROWS = 2            # foculet.json (grid_cols/grid_rows) or the setup picker
+GRID_TIERS = [(3, 2), (3, 3), (4, 3)]  # auto-grow: board expands as it
+                                      # fills (Daniel: >6 -> 3x3, >9 -> 4x3)
+NEVER_PARK_DEFAULT = set()  # Daniel picks these himself in
+                         # foculet.json -> never_park; no preselected apps
 THUMB_MAX = (560, 400)   # fallback; the real size is computed from the
                          # dump monitor's work area and the grid
 
@@ -162,62 +169,274 @@ def safe_rect(hwnd):
         return None
 
 
-def ask_dump_monitor(monitors):
-    """First-run setup: ask Daniel which monitor is the dump monitor and
-    how the board grid should look. Returns (device, cols, rows);
-    remembers them in foculet.json."""
-    choice = {}
-    rightmost = max(monitors, key=lambda m: m["rect"][0])["device"]
+def find_extension_dir():
+    """Where the Foculet Chrome extension lives (shown by the setup wizard)."""
+    for base in (HERE, os.path.dirname(HERE)):
+        cand = os.path.join(base, "extension")
+        if os.path.isfile(os.path.join(cand, "manifest.json")):
+            return cand
+    return os.path.join(os.path.dirname(HERE), "extension")
 
-    root = tk.Tk()
-    root.title("Valet setup")
-    tk.Label(root,
-             text="Which monitor should be the dump monitor?\n"
-                  "Valet will cover it with the parking picture board, so pick\n"
-                  "one you can dedicate to it.",
-             justify="left").pack(padx=16, pady=(16, 8))
-    var = tk.StringVar(value=rightmost)
-    for i, m in enumerate(monitors):
-        l, t, r, b = m["rect"]
-        pos = "left" if i == 0 else ("right" if i == len(monitors) - 1 else "middle")
-        label = f"Monitor {i + 1}: {r - l}x{b - t} at ({l},{t}) — {pos}" + \
-                (" — PRIMARY" if m["primary"] else "")
-        tk.Radiobutton(root, text=label, variable=var,
-                       value=m["device"], anchor="w",
-                       justify="left").pack(anchor="w", padx=16)
 
-    grid = tk.Frame(root)
-    grid.pack(padx=16, pady=(0, 4), anchor="w")
-    tk.Label(grid, text="Board grid:").pack(side="left")
-    cols_var = tk.IntVar(value=GRID_COLS)
-    rows_var = tk.IntVar(value=GRID_ROWS)
-    tk.Spinbox(grid, from_=1, to=8, width=3,
-               textvariable=cols_var).pack(side="left", padx=(8, 2))
-    tk.Label(grid, text="columns  x").pack(side="left")
-    tk.Spinbox(grid, from_=1, to=8, width=3,
-               textvariable=rows_var).pack(side="left", padx=(2, 2))
-    tk.Label(grid, text="rows").pack(side="left")
+class _Onboarding:
+    """4-step setup wizard: welcome -> dump monitor -> Chrome extension ->
+    done. Runs on the Tk thread. Closing the window keeps the current
+    values (same contract as the old first-run picker)."""
 
-    def ok():
-        choice["device"] = var.get()
+    def __init__(self, monitors, cfg, master=None):
+        self.monitors = monitors
+        self.cfg = cfg
+        self.ext_dir = find_extension_dir()
+        devices = {m["device"] for m in monitors}
+        rightmost = max(monitors, key=lambda m: m["rect"][0])["device"]
+        saved = cfg.get("dump_monitor")
+        self._dump_default = saved if saved in devices else rightmost
+        if master is None:
+            self.win = tk.Tk()
+            self._own_root = True
+        else:
+            self.win = tk.Toplevel(master)
+            self._own_root = False
+        w = self.win
+        w.title("Foculet setup")
+        w.configure(bg="#1e1e1e")
+        w.resizable(False, False)
+        prim = next(m for m in monitors if m["primary"])
+        pl, pt, pr, pb = prim["rect"]
+        ww, wh = 540, 460
+        w.geometry(f"{ww}x{wh}+{pl + (pr - pl) // 2 - ww // 2}"
+                   f"+{pt + (pb - pt) // 2 - wh // 2}")
+        self.frames = []
+        self.step = 0
+        body = tk.Frame(w, bg="#1e1e1e")
+        body.pack(fill="both", expand=True, padx=24, pady=(20, 4))
+        self.body = body
+        self._build_welcome()
+        self._build_monitor()
+        self._build_extension()
+        self._build_done()
+        w.protocol("WM_DELETE_WINDOW", self._finish)
+        self._show(0)
+        if self._own_root:
+            w.mainloop()
+        else:
+            w.transient(master)
+            w.grab_set()
+            master.wait_window(w)
+
+    # -- frame plumbing ------------------------------------------------
+
+    def _frame(self):
+        f = tk.Frame(self.body, bg="#1e1e1e")
+        self.frames.append(f)
+        return f
+
+    def _title(self, parent, text):
+        tk.Label(parent, text=text, bg="#1e1e1e", fg="#ffffff",
+                 font=("Segoe UI", 14, "bold")).pack(anchor="w", pady=(0, 12))
+
+    def _body(self, parent, text):
+        tk.Label(parent, text=text, bg="#1e1e1e", fg="#bbbbbb",
+                 font=("Segoe UI", 10), wraplength=480,
+                 justify="left").pack(anchor="w", pady=3)
+
+    def _nav(self, f, back, next_text, on_next=None):
+        row = tk.Frame(f, bg="#1e1e1e")
+        row.pack(side="bottom", fill="x", pady=(20, 0))
+        if back:
+            tk.Button(row, text="< Back",
+                      command=lambda: self._show(self.step - 1),
+                      bg="#2a2a2a", fg="#bbbbbb",
+                      activebackground="#3a3a3a", activeforeground="#ffffff",
+                      bd=0, padx=12, pady=5, cursor="hand2").pack(side="left")
+        tk.Button(row, text=next_text,
+                  command=on_next or (lambda: self._show(self.step + 1)),
+                  bg="#d99a2b", fg="#1a1a1a", activebackground="#e8ab3f",
+                  bd=0, padx=18, pady=5, cursor="hand2",
+                  font=("Segoe UI", 10, "bold")).pack(side="right")
+
+    def _show(self, i):
+        self.step = i
+        for n, f in enumerate(self.frames):
+            if n == i:
+                f.pack(fill="both", expand=True)
+            else:
+                f.pack_forget()
+        if i == 2:  # extension step: check the connection on entry
+            self._test_extension()
+        if i == 3:
+            self._done_summary.configure(
+                text=f"Dump monitor: {self._dump_var.get()}\n"
+                     f"Board: {self._cols_var.get()} x {self._rows_var.get()} "
+                     f"(size applies after a restart)")
+
+    # -- steps ----------------------------------------------------------
+
+    def _build_welcome(self):
+        f = self._frame()
+        self._title(f, "Foculet watches your windows.")
+        self._body(f, "\u2022  Every time you switch windows, the one you "
+                      "left is parked as a picture on your dump monitor.")
+        self._body(f, "\u2022  Minimizing a window parks it too.")
+        self._body(f, "\u2022  Click a picture to bring the window back "
+                      "where it came from. Right-click a picture to close "
+                      "that window after a 20-second countdown.")
+        self._body(f, "\u2022  Fullscreen apps and games are never touched.")
+        self._nav(f, back=False, next_text="Next >")
+
+    def _build_monitor(self):
+        f = self._frame()
+        self._title(f, "Pick your dump monitor")
+        self._body(f, "Foculet covers it with the parking picture board, "
+                      "so pick one you can dedicate to it.")
+        self._dump_var = tk.StringVar(value=self._dump_default)
+        for i, m in enumerate(self.monitors):
+            l, t, r, b = m["rect"]
+            pos = "left" if i == 0 else ("right" if i == len(self.monitors) - 1
+                                        else "middle")
+            label = f"Monitor {i + 1}: {r - l}x{b - t} at ({l},{t}) \u2014 " \
+                    f"{pos}" + (" \u2014 PRIMARY" if m["primary"] else "")
+            tk.Radiobutton(f, text=label, variable=self._dump_var,
+                           value=m["device"], anchor="w", justify="left",
+                           bg="#1e1e1e", fg="#bbbbbb",
+                           selectcolor="#2a2a2a",
+                           activebackground="#1e1e1e",
+                           activeforeground="#ffffff").pack(anchor="w", pady=1)
+        grow = tk.Frame(f, bg="#1e1e1e")
+        grow.pack(anchor="w", pady=(14, 0))
+        tk.Label(grow, text="Board grid:", bg="#1e1e1e", fg="#bbbbbb",
+                 font=("Segoe UI", 10)).pack(side="left")
+        self._cols_var = tk.IntVar(value=self.cfg.get("grid_cols",
+                                                      GRID_COLS))
+        self._rows_var = tk.IntVar(value=self.cfg.get("grid_rows",
+                                                      GRID_ROWS))
+        tk.Spinbox(grow, from_=1, to=8, width=3,
+                   textvariable=self._cols_var).pack(side="left", padx=(8, 2))
+        tk.Label(grow, text="columns  x", bg="#1e1e1e", fg="#bbbbbb",
+                 font=("Segoe UI", 10)).pack(side="left")
+        tk.Spinbox(grow, from_=1, to=8, width=3,
+                   textvariable=self._rows_var).pack(side="left", padx=(2, 2))
+        tk.Label(grow, text="rows", bg="#1e1e1e", fg="#bbbbbb",
+                 font=("Segoe UI", 10)).pack(side="left")
+        self._body(f, "Board size applies after a restart. "
+                      "The monitor itself switches immediately.")
+        self._nav(f, back=True, next_text="Next >")
+
+    def _build_extension(self):
+        f = self._frame()
+        self._title(f, "Install the Chrome extension")
+        self._body(f, "Foculet needs its Chrome extension to separate "
+                      "your tabs.")
+        for n, line in enumerate((
+                "Open chrome://extensions in Chrome.",
+                "Turn on Developer mode (top right).",
+                "Click \u201cLoad unpacked\u201d.",
+                "Select this folder:"), start=1):
+            self._body(f, f"{n}.  {line}")
+        prow = tk.Frame(f, bg="#1e1e1e")
+        prow.pack(fill="x", pady=(2, 4))
+        self._path_var = tk.StringVar(value=self.ext_dir)
+        tk.Entry(prow, textvariable=self._path_var, state="readonly",
+                 readonlybackground="#2a2a2a", fg="#dddddd", bd=0,
+                 font=("Segoe UI", 9)).pack(side="left", fill="x", expand=True,
+                                            ipady=4)
+        tk.Button(prow, text="Copy path", command=self._copy_path,
+                  bg="#2a2a2a", fg="#bbbbbb",
+                  activebackground="#3a3a3a", activeforeground="#ffffff",
+                  bd=0, padx=10, pady=3, cursor="hand2").pack(side="left",
+                                                              padx=(8, 0))
+        self._body(f, "The old \u201cMemyr Chrome Bridge\u201d (assistant / "
+                      "WhatsApp) is separate \u2014 leave it alone. This one "
+                      "talks only to Foculet, on its own local port.")
+        trow = tk.Frame(f, bg="#1e1e1e")
+        trow.pack(anchor="w", pady=(10, 0))
+        self._ext_test = tk.Button(
+            trow, text="Test connection", command=self._test_extension,
+            bg="#2a2a2a", fg="#bbbbbb",
+            activebackground="#3a3a3a", activeforeground="#ffffff",
+            bd=0, padx=12, pady=4, cursor="hand2")
+        self._ext_test.pack(side="left")
+        self._ext_status = tk.Label(trow, text="", bg="#1e1e1e",
+                                    fg="#bbbbbb", font=("Segoe UI", 10))
+        self._ext_status.pack(side="left", padx=(12, 0))
+        self._nav(f, back=True, next_text="Next >")
+
+    def _build_done(self):
+        f = self._frame()
+        self._title(f, "You're set.")
+        self._done_summary = tk.Label(f, bg="#1e1e1e", fg="#bbbbbb",
+                                      font=("Segoe UI", 10), justify="left")
+        self._done_summary.pack(anchor="w", pady=(0, 8))
+        self._body(f, "Right-click the tray icon any time to re-run this "
+                      "setup, pause parking, or exit Foculet.")
+        self._nav(f, back=True, next_text="Finish", on_next=self._finish)
+
+    # -- actions ---------------------------------------------------------
+
+    def _copy_path(self):
         try:
-            choice["cols"] = max(1, min(8, int(cols_var.get())))
-            choice["rows"] = max(1, min(8, int(rows_var.get())))
+            self.win.clipboard_clear()
+            self.win.clipboard_append(self.ext_dir)
         except Exception:
-            choice["cols"], choice["rows"] = GRID_COLS, GRID_ROWS
-        root.destroy()
+            pass
 
-    tk.Button(root, text="Use this monitor", command=ok).pack(pady=16)
-    root.update_idletasks()
-    prim = next(m for m in monitors if m["primary"])
-    pl, pt, pr, pb = prim["rect"]
-    w, h = root.winfo_width(), root.winfo_height()
-    root.geometry(f"+{pl + (pr - pl) // 2 - w // 2}+{pt + (pb - pt) // 2 - h // 2}")
-    root.protocol("WM_DELETE_WINDOW", ok)  # closing picks the defaults
-    root.mainloop()
-    return (choice.get("device") or rightmost,
-            choice.get("cols") or GRID_COLS,
-            choice.get("rows") or GRID_ROWS)
+    def _test_extension(self):
+        try:
+            self._ext_status.configure(text="Pinging\u2026", fg="#bbbbbb")
+            self._ext_test.configure(state="disabled")
+        except Exception:
+            return
+        def _go():
+            try:
+                ok, data = bridge_cmd("ping", timeout=8)
+                good = bool(ok and data == "pong")
+            except Exception:
+                good = False
+            try:
+                self.win.after(0, lambda: self._ext_test_done(good))
+            except Exception:
+                pass
+        threading.Thread(target=_go, daemon=True).start()
+
+    def _ext_test_done(self, good):
+        try:
+            self._ext_test.configure(state="normal")
+            if good:
+                self._ext_status.configure(text="Connected \u2713",
+                                           fg="#7fbf7f")
+            else:
+                self._ext_status.configure(
+                    text="Not responding \u2014 finish the steps above, "
+                         "then test again.",
+                    fg="#d97a7a")
+        except Exception:
+            pass
+
+    def _finish(self):
+        try:
+            cols = max(1, min(8, int(self._cols_var.get())))
+            rows = max(1, min(8, int(self._rows_var.get())))
+        except Exception:
+            cols, rows = GRID_COLS, GRID_ROWS
+        self.cfg["dump_monitor"] = self._dump_var.get()
+        self.cfg["grid_cols"] = cols
+        self.cfg["grid_rows"] = rows
+        try:
+            self.win.destroy()
+        except Exception:
+            pass
+
+    def result(self):
+        return self.cfg
+
+
+def onboarding_wizard(monitors, cfg, master=None):
+    """4-step setup wizard (welcome, dump monitor, Chrome extension, done).
+    Returns the updated cfg dict. Closing the window keeps the current
+    values."""
+    cfg.setdefault("grid_cols", GRID_COLS)
+    cfg.setdefault("grid_rows", GRID_ROWS)
+    return _Onboarding(monitors, cfg, master).result()
 
 
 def pick_dump(monitors, spec):
@@ -326,17 +545,23 @@ def age_badge(age_s):
     return txt, "#d95f2b"       # waiting long
 
 
-def parkable(hwnd, dump_device, excluded_exes):
-    """True if this window is eligible to be parked right now."""
+def parkable(hwnd, dump_device, excluded_exes, never_park=frozenset(),
+             quiet=False, allow_iconic=False):
+    """True if this window is eligible to be parked right now.
+
+    quiet: don't log the reason for a skip (for high-frequency checks).
+    allow_iconic: the minimize hook fires after the window is already
+    iconic - eligibility without the minimized check."""
     def no(why):
-        log(f"skip '{safe_title(hwnd)}': {why}")
+        if not quiet:
+            log(f"skip '{safe_title(hwnd)}': {why}")
         return False
     if hwnd == OWN_CONSOLE:
         return False
     try:
         if not win32gui.IsWindow(hwnd) or not win32gui.IsWindowVisible(hwnd):
             return no("not a live/visible window")
-        if win32gui.IsIconic(hwnd):
+        if win32gui.IsIconic(hwnd) and not allow_iconic:
             return no("already minimized")
         if win32gui.GetParent(hwnd):          # not a top-level window
             return no("not top-level")
@@ -351,6 +576,8 @@ def parkable(hwnd, dump_device, excluded_exes):
         return no("no title")
     if exe_of(hwnd) in excluded_exes:
         return no("in excluded_exes")
+    if exe_of(hwnd).lower() in never_park:
+        return no("key app - never parked")
     try:
         rect = win32gui.GetWindowRect(hwnd)
     except Exception:
@@ -460,13 +687,103 @@ def make_placeholder_thumb(path, title, size=(296, 200)):
         log(f"placeholder failed: {e}")
 
 
-# ---------------------------------------------------------------- foculet
+# ---------------------------------------------------------------- bridge
 
-BRIDGE_URL = "http://127.0.0.1:18721"
+FOCULET_BRIDGE_PORT = 18722  # Foculet's own localhost command queue for
+                             # the Foculet Bridge Chrome extension.
+                             # Independent of the Memyr bridge on 18721.
+BRIDGE_URL = "http://127.0.0.1:%d" % FOCULET_BRIDGE_PORT
+
+_bridge_queue = []    # [{id, action, args}]
+_bridge_results = {}  # id -> {ok, data, error}
+_bridge_lock = threading.Condition()
+
+
+class _BridgeHandler(BaseHTTPRequestHandler):
+    """Serves the Foculet Bridge extension: long-poll /poll for commands,
+    POST /cmd to enqueue, GET /result/<id>, POST /result to report back."""
+
+    def _json(self, obj, code=200):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path == "/poll":
+            # Long-poll up to 25s for the next command (keeps the
+            # extension's service worker responsive).
+            deadline = time.time() + 25
+            with _bridge_lock:
+                while True:
+                    if _bridge_queue:
+                        return self._json(_bridge_queue.pop(0))
+                    remaining = deadline - time.time()
+                    if remaining <= 0:
+                        return self._json({"wait": True})
+                    _bridge_lock.wait(timeout=min(remaining, 5))
+        elif self.path.startswith("/result/"):
+            cid = self.path[len("/result/"):]
+            with _bridge_lock:
+                if cid in _bridge_results:
+                    return self._json(_bridge_results.pop(cid))
+            return self._json({"pending": True})
+        elif self.path == "/health":
+            with _bridge_lock:
+                return self._json({"ok": True,
+                                   "queued": len(_bridge_queue)})
+        else:
+            self.send_error(404)
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        try:
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except Exception:
+            body = {}
+        if self.path == "/cmd":
+            cid = uuid.uuid4().hex[:8]
+            with _bridge_lock:
+                _bridge_queue.append({
+                    "id": cid,
+                    "action": body.get("action"),
+                    "args": body.get("args") or {},
+                })
+                _bridge_lock.notify_all()
+            return self._json({"id": cid})
+        elif self.path == "/result":
+            cid = body.get("id")
+            if cid:
+                with _bridge_lock:
+                    _bridge_results[cid] = {
+                        "ok": body.get("ok", True),
+                        "data": body.get("data"),
+                        "error": body.get("error"),
+                    }
+                    _bridge_lock.notify_all()
+            return self._json({"stored": True})
+        else:
+            self.send_error(404)
+
+    def log_message(self, *args):
+        pass
+
+
+def start_bridge_server():
+    """Start Foculet's own Chrome command queue (localhost-only)."""
+    server = ThreadingHTTPServer(("127.0.0.1", FOCULET_BRIDGE_PORT),
+                                 _BridgeHandler)
+    server.daemon_threads = True
+    t = threading.Thread(target=server.serve_forever, daemon=True,
+                         name="foculet-bridge")
+    t.start()
+    return server
 
 
 def bridge_cmd(action, args=None, timeout=10):
-    """Send a command to the Memyr Chrome bridge on this PC.
+    """Send a command to the Foculet Bridge extension on this PC.
 
     Returns (ok, data_or_error). Quietly reports unreachable/timeout -
     the caller decides how loudly to complain."""
@@ -499,10 +816,14 @@ def bridge_cmd(action, args=None, timeout=10):
         return False, "bridge unreachable: %s" % (e,)
 
 
-class Valet:
+class Foculet:
     def __init__(self, dump_spec, excluded_exes,
-                 grid_cols=GRID_COLS, grid_rows=GRID_ROWS):
+                 grid_cols=GRID_COLS, grid_rows=GRID_ROWS,
+                 never_park=(), config_path=None):
         self.excluded = set(excluded_exes)
+        # key apps (chat etc.) that are never parked, even on a switch
+        self.never_park = {e.lower() for e in never_park} | \
+            {e.lower() for e in NEVER_PARK_DEFAULT}
         self.monitors = list_monitors()
         self.by_device = {m["device"]: m for m in self.monitors}
         self.dump = pick_dump(self.monitors, dump_spec)
@@ -528,6 +849,14 @@ class Valet:
         self._paused = threading.Event()  # set from the tray menu: parking
                                           # halts until resumed
         self._tray_hwnd = None  # tray message window (tray thread)
+        self._config_path = config_path  # foculet.json, for setup re-runs
+        self._parking = set()  # hwnds currently inside park(): the minimize
+                               # hook must not re-park our own minimize
+        self._notify_queue = []  # pending tray balloon tips (tray thread)
+        self._thumb_cache = {}  # hwnd -> png path: fresh snapshot of the
+                                # focused window, so a later minimize can
+                                # park it with a real picture (an iconic
+                                # window can't be captured)
         self.parked = {}  # hwnd -> {"origin_rect", "origin_device", "exe",
                           #          "title", "thumb", "was_maximized"}
         self.current = {}  # monitor device -> hwnd currently owning that screen
@@ -544,29 +873,158 @@ class Valet:
         log(f"dump monitor: {self.dump['device']} {self.dump['rect']}")
         log(f"mode: park on every switch, board "
             f"{self.grid_cols}x{self.grid_rows}, "
-            f"excluded: {sorted(self.excluded) or 'none'}")
+            f"excluded: {sorted(self.excluded) or 'none'}, "
+            f"never-park: {sorted(self.never_park) or 'none'}")
 
     # -- parking ----------------------------------------------------
 
-    def park(self, hwnd):
+    def _grow_grid(self):
+        """Grow the board to the next GRID_TIERS step. True if it grew.
+
+        Called from park() (watcher thread): only touches plain
+        attributes. The Tk grid reconfigure happens in rebuild_lot,
+        which runs on the main thread."""
+        cur_cells = self.grid_cols * self.grid_rows
+        nxt = None
+        for cols, rows in GRID_TIERS:
+            if cols * rows > cur_cells:
+                nxt = (cols, rows)
+                break
+        if not nxt:
+            return False
+        cols, rows = nxt
+        self.grid_cols, self.grid_rows = cols, rows
+        self.max_parked = cols * rows
+        wl, wt, wr, wb = self.dump["work"]
+        cell_w = (wr - wl - 24) // cols - 12
+        cell_h = (wb - wt - 24) // rows - 12
+        self.thumb_max = (max(240, cell_w - 8), max(160, cell_h - 48))
+        self._lot_key = None  # force a full rebuild on the next tick
+        log(f"board grew to {cols}x{rows} ({self.max_parked} slots)")
+        return True
+
+    def _warm_cache(self):
+        """Snapshot every eligible window once at startup, so windows
+        that were already open (never focused since we started) still
+        park with a real picture when minimized."""
+        time.sleep(2)  # let the tray/board settle first
+        try:
+            hwnds = []
+            win32gui.EnumWindows(lambda h, _: hwnds.append(h) or True, None)
+        except Exception:
+            return
+        n = 0
+        for hwnd in hwnds:
+            if self._paused.is_set():
+                return
+            before = len(self._thumb_cache)
+            self._cache_thumb(hwnd)
+            if len(self._thumb_cache) > before:
+                n += 1
+        log(f"thumbnail cache warmed: {n} window(s)")
+
+    def _cache_thumb(self, hwnd):
+        """Snapshot the newly focused window. If the user minimizes it
+        later, the minimize hook fires too late to capture (the window is
+        already iconic) - this cache is the picture it parks with."""
+        if not hwnd or hwnd in self.parked_keys():
+            return
+        try:
+            if win32process.GetWindowThreadProcessId(hwnd)[1] == os.getpid():
+                return  # our own window (board, setup wizard)
+        except Exception:
+            return
+        if not parkable(hwnd, self.dump["device"], self.excluded,
+                        self.never_park, quiet=True):
+            return
         with self.lock:
+            self._thumb_seq += 1
+            seq = self._thumb_seq
+            while len(self._thumb_cache) >= 24:  # bound the cache
+                oldest = next(iter(self._thumb_cache))
+                try:
+                    os.remove(self._thumb_cache.pop(oldest))
+                except Exception:
+                    pass
+        path = os.path.join(THUMB_DIR, f"cache_{hwnd}_{seq}.png")
+        if capture_thumbnail(hwnd, path, self.thumb_max):
+            with self.lock:
+                prev = self._thumb_cache.pop(hwnd, None)
+                self._thumb_cache[hwnd] = path
+            if prev:
+                try:
+                    os.remove(prev)
+                except Exception:
+                    pass
+        else:
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+
+    def _drop_cache(self, hwnd):
+        with self.lock:
+            path = self._thumb_cache.pop(hwnd, None)
+        if path:
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+
+    def park(self, hwnd, thumb_src=None):
+        # The minimize hook can fire while we are already parking this
+        # window (our own minimize); never park a window twice.
+        with self.lock:
+            if hwnd in self._parking:
+                return
+            self._parking.add(hwnd)
+        try:
+            self._park_inner(hwnd, thumb_src)
+        finally:
+            with self.lock:
+                self._parking.discard(hwnd)
+
+    def _park_inner(self, hwnd, thumb_src=None):
+        with self.lock:
+            # board full? grow through the tiers before giving up
+            while len(self.parked) >= self.max_parked and self._grow_grid():
+                pass
             if len(self.parked) >= self.max_parked:
                 log(f"board full ({self.max_parked}); "
                     f"not parking '{safe_title(hwnd)}'")
                 return
         try:
-            rect = win32gui.GetWindowRect(hwnd)
+            placement = win32gui.GetWindowPlacement(hwnd)
         except Exception:
-            return
+            placement = None
+        if placement and placement[1] == win32con.SW_SHOWMINIMIZED:
+            # parked from the minimize hook: GetWindowRect is garbage for
+            # an iconic window - restore from the placement's normal rect
+            rect = placement[4]
+            was_max = bool(placement[0] & getattr(
+                win32con, "WPF_RESTORETOMAXIMIZED", 2))
+        else:
+            try:
+                rect = win32gui.GetWindowRect(hwnd)
+            except Exception:
+                return
+            was_max = is_maximized(hwnd)
         mon = monitor_from_rect(rect)
         title = safe_title(hwnd)
         with self.lock:
             self._thumb_seq += 1
             seq = self._thumb_seq
         thumb = os.path.join(THUMB_DIR, f"{hwnd}_{seq}.png")
-        if not capture_thumbnail(hwnd, thumb, self.thumb_max):
-            make_placeholder_thumb(thumb, title, self.thumb_max)
-        was_max = is_maximized(hwnd)
+        if thumb_src and os.path.exists(thumb_src):
+            # a fresh snapshot from when the window was focused (used by
+            # the minimize path - an iconic window can't be captured)
+            try:
+                shutil.copy(thumb_src, thumb)
+            except Exception:
+                thumb_src = None
+        if not thumb_src or not os.path.exists(thumb):
+            if not capture_thumbnail(hwnd, thumb, self.thumb_max):
+                make_placeholder_thumb(thumb, title, self.thumb_max)
         try:
             win32gui.ShowWindow(hwnd, win32con.SW_MINIMIZE)
         except Exception as e:
@@ -592,6 +1050,7 @@ class Valet:
             for dev, h in list(self.current.items()):
                 if h == hwnd:
                     del self.current[dev]  # no longer any screen's current window
+        self._drop_cache(hwnd)  # its focus-time snapshot is now the picture
         log(f"PARKED '{title}' -> {self.dump['device']}")
 
     def unpark(self, hwnd):
@@ -669,6 +1128,16 @@ class Valet:
                                highlightthickness=1)
             except Exception:
                 pass
+        # restore the badge: without this the red countdown stays frozen,
+        # because _tick_badges only runs while a close is pending
+        for h, badge, pa in getattr(self, "_badge_widgets", []):
+            if h == hwnd:
+                try:
+                    txt, fg = age_badge(time.time() - pa)
+                    badge.configure(text=txt, fg=fg)
+                except Exception:
+                    pass
+                break
         log(f"close CANCELLED for '{pend['title']}' ({why})")
 
     def _fire_close(self, hwnd):
@@ -703,6 +1172,10 @@ class Valet:
                 os.remove(p["thumb"])
             except Exception:
                 pass
+        with self.lock:
+            dead_cached = [h for h in self._thumb_cache if not is_alive(h)]
+        for h in dead_cached:
+            self._drop_cache(h)
 
     def parked_keys(self):
         with self.lock:
@@ -715,6 +1188,8 @@ class Valet:
 
     _TRAY_ID_PAUSE = 1001
     _TRAY_ID_EXIT = 1002
+    _TRAY_ID_SETUP = 1003
+    _TRAY_NOTIFY = win32con.WM_USER + 21  # posted when a balloon tip waits
 
     def _make_tray_hicon(self):
         """Build the amber icon directly as an HICON (32-bit color +
@@ -767,6 +1242,8 @@ class Valet:
                             win32con.MF_STRING | win32con.MF_DISABLED,
                             0, "1 parked" if n == 1 else f"{n} parked")
         win32gui.AppendMenu(menu, win32con.MF_SEPARATOR, 0, "")
+        win32gui.AppendMenu(menu, win32con.MF_STRING, self._TRAY_ID_SETUP,
+                            "Setup\u2026")
         win32gui.AppendMenu(menu, win32con.MF_STRING, self._TRAY_ID_PAUSE,
                             "Resume parking" if self._paused.is_set()
                             else "Pause parking")
@@ -799,9 +1276,15 @@ class Valet:
             if lparam in (win32con.WM_LBUTTONUP, win32con.WM_RBUTTONUP):
                 self._show_tray_menu(hwnd)
             return 0
+        if msg == self._TRAY_NOTIFY:
+            self._flush_notifications(hwnd)
+            return 0
         if msg == win32con.WM_COMMAND:
             wid = win32api.LOWORD(wparam)
-            if wid == self._TRAY_ID_PAUSE:
+            if wid == self._TRAY_ID_SETUP:
+                # the wizard must run on the Tk thread, not the tray thread
+                self.root.after(0, self.open_setup)
+            elif wid == self._TRAY_ID_PAUSE:
                 if self._paused.is_set():
                     self._paused.clear()
                     log("parking resumed from tray")
@@ -835,7 +1318,7 @@ class Valet:
             "TaskbarCreated")
         wc = win32gui.WNDCLASS()
         wc.lpfnWndProc = self._tray_wndproc
-        wc.lpszClassName = "ValetTrayWindow"
+        wc.lpszClassName = "FoculetTrayWindow"
         try:
             win32gui.RegisterClass(wc)
         except Exception:
@@ -857,20 +1340,120 @@ class Valet:
         self._tray_hwnd = None
 
     def start_tray(self):
-        self._app_name = self.root.title() or "Valet"
+        self._app_name = self.root.title() or "Foculet"
         t = threading.Thread(target=self._tray_main, daemon=True,
                              name="foculet-tray")
         t.start()
 
+    def notify(self, title, msg):
+        """Balloon tip on the tray icon. Thread-safe: the tip itself is
+        shown on the tray thread."""
+        with self.lock:
+            self._notify_queue.append((title, msg))
+        hwnd = self._tray_hwnd
+        if hwnd:
+            try:
+                win32gui.PostMessage(hwnd, self._TRAY_NOTIFY, 0, 0)
+            except Exception:
+                pass
+
+    def _flush_notifications(self, hwnd):
+        with self.lock:
+            items = self._notify_queue
+            self._notify_queue = []
+        nif_info = getattr(win32gui, "NIF_INFO", 0x10)
+        niif_info = getattr(win32con, "NIIF_INFO", 1)
+        for title, msg in items:
+            try:
+                win32gui.Shell_NotifyIcon(
+                    win32gui.NIM_MODIFY,
+                    (hwnd, 0, nif_info, 0, 0, "",
+                     msg, 0, title, niif_info))
+            except Exception as e:
+                log(f"tray notify failed: {e}")
+
+    # -- setup (re-runnable from the tray) -----------------------------
+
+    def open_setup(self):
+        """Re-run the setup wizard. Called on the Tk thread."""
+        if not self._config_path:
+            return
+        try:
+            cfg = load_config(self._config_path)
+        except Exception:
+            cfg = {}
+        cfg.setdefault("excluded_exes", sorted(self.excluded))
+        cfg.setdefault("never_park", sorted(self.never_park))
+        new = onboarding_wizard(self.monitors, cfg, master=self.root)
+        save_config(self._config_path, new)
+        self.apply_setup(new)
+        self.notify("Foculet", "Setup complete.")
+
+    def apply_setup(self, cfg):
+        """Apply wizard choices live. The dump monitor moves immediately;
+        the board grid size takes effect on the next start."""
+        new_dump = cfg.get("dump_monitor")
+        if new_dump and new_dump != self.dump["device"]:
+            self.monitors = list_monitors()
+            self.by_device = {m["device"]: m for m in self.monitors}
+            try:
+                self.dump = pick_dump(self.monitors, new_dump)
+            except ValueError as e:
+                log(f"dump switch failed: {e}")
+                return
+            wl, wt, wr, wb = self.dump["work"]
+            try:
+                self.root.geometry(f"{wr - wl}x{wb - wt}+{wl}+{wt}")
+            except Exception as e:
+                log(f"board move failed: {e}")
+            log(f"dump monitor switched to {self.dump['device']}")
+            self.notify("Foculet",
+                        f"Dump monitor is now {self.dump['device']}.")
+
     # -- picture board (runs on the main/Tk thread) ------------------
+
+    def _toggle_pause(self):
+        if self._paused.is_set():
+            self._paused.clear()
+            log("parking resumed from board bar")
+        else:
+            self._paused.set()
+            log("parking paused from board bar")
+        self._sync_topbar()
+
+    def _sync_topbar(self, n=None):
+        try:
+            if n is None:
+                with self.lock:
+                    n = len(self.parked)
+            self._top_label.configure(
+                text=f"Foculet · {n} parked" if n != 1 else "Foculet · 1 parked")
+            self._pause_btn.configure(
+                text="Resume" if self._paused.is_set() else "Pause")
+        except Exception:
+            pass
 
     def build_lot(self):
         self.root = tk.Tk()
-        self.root.title("Valet")
+        self.root.title("Foculet")
         self.root.configure(bg="#141414")
         self.root.overrideredirect(True)  # borderless: just the board
         wl, wt, wr, wb = self.dump["work"]
         self.root.geometry(f"{wr - wl}x{wb - wt}+{wl}+{wt}")
+        # slim top bar: board identity, parked count, pause/resume
+        self.topbar = tk.Frame(self.root, bg="#1e1e1e", height=30)
+        self.topbar.pack(side="top", fill="x")
+        self.topbar.pack_propagate(False)
+        self._top_label = tk.Label(self.topbar, text="Foculet",
+                                   fg="#999999", bg="#1e1e1e",
+                                   font=("Segoe UI", 9))
+        self._top_label.pack(side="left", padx=10)
+        self._pause_btn = tk.Button(
+            self.topbar, text="Pause", command=self._toggle_pause,
+            fg="#bbbbbb", bg="#2a2a2a", activeforeground="#ffffff",
+            activebackground="#3a3a3a", font=("Segoe UI", 9),
+            bd=0, padx=10, pady=2, cursor="hand2")
+        self._pause_btn.pack(side="right", padx=8, pady=3)
         self.grid_frame = tk.Frame(self.root, bg="#141414")
         self.grid_frame.pack(expand=True, fill="both", padx=12, pady=12)
         for c in range(self.grid_cols):
@@ -897,6 +1480,12 @@ class Valet:
         self.root.after(500, self.refresh_lot)
 
     def rebuild_lot(self, items):
+        # the grid may have grown since the last build (auto-grow tiers):
+        # reconfigure columns/rows here, on the main thread
+        for c in range(self.grid_cols):
+            self.grid_frame.grid_columnconfigure(c, weight=1, uniform="cell")
+        for r in range(self.grid_rows):
+            self.grid_frame.grid_rowconfigure(r, weight=1, uniform="cell")
         for w in self.grid_frame.winfo_children():
             w.destroy()
         self._photos = []
@@ -1008,6 +1597,7 @@ class Valet:
                         (hwnd, 0, win32gui.NIF_TIP, 0, 0, tip))
                 except Exception:
                     pass
+            self._sync_topbar(len(items))
         except Exception as e:
             log(f"lot refresh failed: {e}")
         self.root.after(500, self.refresh_lot)
@@ -1072,11 +1662,92 @@ class Valet:
             if (prev_current and prev_current != fg
                     and prev_current not in self.parked_keys()
                     and parkable(prev_current, self.dump["device"],
-                                 self.excluded)):
+                                 self.excluded, self.never_park)):
                 self.park(prev_current)  # park() enforces the board cap
             if fg != OWN_CONSOLE:
                 with self.lock:
                     self.current[dev] = fg
+        # keep a fresh snapshot of the newly focused window: if the user
+        # minimizes it later, the minimize hook fires too late to capture
+        # (the window is already iconic) - the cache is the picture.
+        if fg and not self._paused.is_set() and not self._tab_op.is_set():
+            self._cache_thumb(fg)
+
+    # -- minimize parking (its own thread with a message pump) ---------
+
+    def _minimize_hook_main(self):
+        """Catch the user's minimize via EVENT_SYSTEM_MINIMIZESTART and
+        park the window exactly like a focus-switch park. NOTE: the event
+        is delivered out-of-context, after the window is already iconic
+        (verified by probe) - so the picture comes from the focus-time
+        snapshot cache, not a fresh capture."""
+        import ctypes.wintypes as wt
+        EVENT_SYSTEM_MINIMIZESTART = 0x0016
+        WINEVENT_OUTOFCONTEXT = 0x0000
+
+        @ctypes.WINFUNCTYPE(None, wt.HANDLE, wt.DWORD, wt.HWND, wt.LONG,
+                           wt.LONG, wt.DWORD, wt.DWORD)
+        def _cb(hhook, event, hwnd, id_obj, id_child, tid, ts):
+            try:
+                self.on_minimize_start(hwnd)
+            except Exception as e:
+                log(f"minimize hook: {e}")
+
+        self._min_hook_cb = _cb  # keep alive: the hook holds no reference
+        hook = ctypes.windll.user32.SetWinEventHook(
+            EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZESTART,
+            None, _cb, 0, 0, WINEVENT_OUTOFCONTEXT)
+        if not hook:
+            log("minimize hook failed to install; minimize-parking is off")
+            return
+        self._min_hook = hook
+        log("minimize hook installed - minimizing a window parks it too")
+        msg = wt.MSG()
+        while ctypes.windll.user32.GetMessageW(ctypes.byref(msg), None, 0, 0):
+            ctypes.windll.user32.TranslateMessage(ctypes.byref(msg))
+            ctypes.windll.user32.DispatchMessageW(ctypes.byref(msg))
+
+    def on_minimize_start(self, hwnd):
+        """The user minimized a window: park it the same way a switch
+        would. Runs on the hook thread. The hook fires after the window
+        is already iconic (verified by probe), so the picture comes from
+        the focus-time snapshot cache - an iconic window can't be
+        captured."""
+        if not hwnd or hwnd in self.parked_keys():
+            return
+        with self.lock:
+            if (self._paused.is_set() or hwnd in self._parking
+                    or time.time() < self._quiet_until):
+                return
+            thumb_src = self._thumb_cache.get(hwnd)
+        if self._tab_op.is_set():
+            return  # a tab tear-off is in flight; it owns focus right now
+        if hwnd == getattr(self, "_tray_hwnd", None):
+            return
+        try:
+            if win32process.GetWindowThreadProcessId(hwnd)[1] == os.getpid():
+                return  # our own window (board, setup wizard): never park it
+        except Exception:
+            return
+        try:
+            placement = win32gui.GetWindowPlacement(hwnd)
+        except Exception:
+            return
+        normal = placement[4] if placement else None
+        if not normal:
+            return
+        # NOTE: GetWindowRect is garbage for an iconic window - the two
+        # rect-dependent checks must use the placement's normal rect.
+        if is_fullscreen(hwnd, normal):
+            return  # never yank a fullscreen app/game
+        mon = monitor_from_rect(normal)
+        if mon and mon["device"] == self.dump["device"]:
+            return  # minimizing a window that's already on the dump board
+        if not parkable(hwnd, self.dump["device"], self.excluded,
+                        self.never_park, quiet=True, allow_iconic=True):
+            return
+        log(f"minimized by user - parking '{safe_title(hwnd)}'")
+        self.park(hwnd, thumb_src=thumb_src)
 
     # -- chrome tab parking (runs on a background thread) -------------
 
@@ -1107,6 +1778,20 @@ class Valet:
         except Exception:
             pass
         return out
+
+    def _chrome_hwnd_for(self, fwin):
+        """Find the OS window handle of a Chrome window by its rect."""
+        want = (fwin.get("left") or 0, fwin.get("top") or 0,
+                (fwin.get("left") or 0) + (fwin.get("width") or 0),
+                (fwin.get("top") or 0) + (fwin.get("height") or 0))
+        for hwnd in self.chrome_hwnds():
+            try:
+                r = win32gui.GetWindowRect(hwnd)
+            except Exception:
+                continue
+            if all(abs(a - b) <= 8 for a, b in zip(r, want)):
+                return hwnd
+        return None
 
     def tab_watcher(self):
         """Poll Chrome for tab switches in the focused window.
@@ -1160,8 +1845,7 @@ class Valet:
         """Tear old_tab off into its own window and park it.
 
         Returns True when the tab is handled (parked, or deliberately left
-        alone) and False when the detach failed and the watcher should
-        retry on its next poll.
+        alone) and False when the detach failed.
         """
         # never tear off tabs from a Chrome window on the dump monitor
         cx = (fwin.get("left") or 0) + (fwin.get("width") or 0) // 2
@@ -1192,6 +1876,10 @@ class Valet:
                         new_hwnd = fg
                         break
                 time.sleep(0.25)
+            if new_hwnd is None:
+                # lone-tab window (detach was a no-op) or a missed diff:
+                # match the Chrome window by its rectangle instead
+                new_hwnd = self._chrome_hwnd_for(fwin)
             # confirm the detach really happened: our tab alone in the
             # returned window, and that window focused
             verified = False
@@ -1207,7 +1895,7 @@ class Valet:
                 log("chrome detach: not verified, leaving window alone")
                 return True
             if new_hwnd and parkable(new_hwnd, self.dump["device"],
-                                     self.excluded):
+                                     self.excluded, self.never_park):
                 log(f"tab torn off -> '{safe_title(new_hwnd)}'")
                 self.park(new_hwnd)
             else:
@@ -1234,6 +1922,12 @@ class Valet:
     def run(self):
         self.build_lot()
         self.root.report_callback_exception = self._tk_crash
+        try:
+            start_bridge_server()  # Foculet's own Chrome command queue
+            log(f"bridge server listening on 127.0.0.1:{FOCULET_BRIDGE_PORT}")
+        except OSError as e:
+            log(f"WARNING: could not start bridge server: {e} "
+                f"(a stale Foculet may still be running?)")
         self.start_tray()  # needs root (for the title); runs its own thread
         t = threading.Thread(target=self.watcher, daemon=True,
                              name="foculet-watcher")
@@ -1241,11 +1935,28 @@ class Valet:
         c = threading.Thread(target=self.tab_watcher, daemon=True,
                              name="foculet-tabs")
         c.start()
+        m = threading.Thread(target=self._minimize_hook_main, daemon=True,
+                             name="foculet-minimize")
+        m.start()
+        w = threading.Thread(target=self._warm_cache, daemon=True,
+                             name="foculet-warmcache")
+        w.start()
+        if getattr(self, "_fresh_setup", False):
+            # first run went through the setup wizard: say hello on the
+            # tray once everything is up
+            def _hello():
+                time.sleep(6)
+                self.notify(
+                    "Foculet",
+                    "Setup complete - Foculet is watching. Right-click "
+                    "the tray icon any time to re-run setup.")
+            threading.Thread(target=_hello, daemon=True,
+                             name="foculet-hello").start()
         self.root.mainloop()
 
 
 def load_config(path):
-    cfg = {"excluded_exes": []}
+    cfg = {"excluded_exes": [], "never_park": []}
     if os.path.exists(path):
         with open(path, encoding="utf-8") as f:
             cfg.update(json.load(f))
@@ -1260,7 +1971,7 @@ def save_config(path, cfg):
 def main():
     _install_crash_handlers()
     ap = argparse.ArgumentParser(
-        description="Valet - parks your previous window on the dump monitor")
+        description="Foculet - parks your previous window on the dump monitor")
     ap.add_argument("--dump", default=None,
                     help="rightmost | primary | <index> | <device name>")
     ap.add_argument("--config", default=os.path.join(HERE, "foculet.json"))
@@ -1270,17 +1981,21 @@ def main():
     dump = args.dump or cfg.get("dump_monitor")
     grid_cols = cfg.get("grid_cols", GRID_COLS)
     grid_rows = cfg.get("grid_rows", GRID_ROWS)
+    fresh_setup = False
     if not dump:
-        # first run: ask which monitor is the dump and how the board
-        # should look, then remember it
-        dump, grid_cols, grid_rows = ask_dump_monitor(list_monitors())
-        cfg["dump_monitor"] = dump
-        cfg["grid_cols"] = grid_cols
-        cfg["grid_rows"] = grid_rows
+        # first run: the setup wizard (welcome, dump monitor, Chrome
+        # extension, done), then remember the choices
+        cfg = onboarding_wizard(list_monitors(), cfg)
         save_config(args.config, cfg)
-        log(f"dump monitor chosen: {dump} (board {grid_cols}x{grid_rows})")
+        dump = cfg.get("dump_monitor")
+        grid_cols = cfg.get("grid_cols", GRID_COLS)
+        grid_rows = cfg.get("grid_rows", GRID_ROWS)
+        fresh_setup = True
+        log(f"setup complete: dump={dump} (board {grid_cols}x{grid_rows})")
 
-    foculet = Valet(dump, cfg["excluded_exes"], grid_cols, grid_rows)
+    foculet = Foculet(dump, cfg["excluded_exes"], grid_cols, grid_rows,
+                  cfg.get("never_park", []), config_path=args.config)
+    foculet._fresh_setup = fresh_setup
     try:
         foculet.run()
     except KeyboardInterrupt:
@@ -1303,3 +2018,6 @@ if __name__ == "__main__":
         except Exception:
             pass
         sys.exit(1)
+
+
+
