@@ -14,6 +14,7 @@ Your dump monitor is sacred ground: a live parking lot, not a workspace.
 1. **Focus watcher** (background thread, polls every 0.5s). Each monitor
    remembers its *current* window. When a new window takes focus on a
    monitor, that monitor's previous window is eligible for parking.
+   Minimizing a window counts as switching away: it parks too.
 2. **Park.** Foculet snapshots the window (`PrintWindow` — works even for
    windows behind other windows), minimizes the real window, and pins the
    snapshot to the board.
@@ -39,16 +40,15 @@ A Chrome extension watches tab switches in the focused Chrome window. When
 you move to a new tab, the previous tab is *torn off* into its own window
 (`chrome.windows.create({tabId})`) and parked through the normal flow.
 Restoring brings the window back — it is not re-attached to the original
-window. The extension talks to a tiny local bridge server
-(`bridge-server.py`, HTTP on `127.0.0.1:18721`); Foculet polls it for tab
-state and sends it detach/close commands.
+window. The extension talks to a tiny bridge server built into Foculet
+itself (HTTP on `127.0.0.1:18722`, localhost only); Foculet polls it for
+tab state and sends it detach commands.
 
 ## Components
 
 | File | What it is |
 |---|---|
-| `foculet.py` | The whole app: watcher, parker, board, tab logic |
-| `bridge-server.py` | Localhost HTTP bridge (`127.0.0.1:18721`) the extension long-polls for commands |
+| `foculet.py` | The whole app: watcher, parker, board, tab logic, Chrome bridge server |
 | `extension/background.js` | Chrome extension service worker: tab watcher, tab tear-off |
 | `extension/manifest.json` | Extension manifest (Manifest V3) |
 | `ctl.ps1` | `status` / `stop` / `start` control script for Windows |
@@ -67,21 +67,21 @@ git clone https://github.com/dt-memyrlabs/foculet.git
 cd foculet
 pip install pywin32 pillow
 
-# 1. Bridge server (leave running) — lets the extension talk to Foculet
-python bridge-server.py
-
-# 2. Chrome extension — chrome://extensions → Developer mode →
+# 1. Chrome extension — chrome://extensions → Developer mode →
 #    "Load unpacked" → select the extension/ folder
+#    (leave any other extensions alone)
 
-# 3. Foculet itself (no console window - it lives in the system tray)
+# 2. Foculet itself (no console window - it lives in the system tray)
 .\ctl.ps1 -Action start
 ```
 
 The tray icon (bottom-right) shows the parked count, and its menu has
 Pause parking / Resume parking and Exit. Right-click it anytime.
 
-On first run Foculet shows a small monitor picker if it can't tell which
-monitor is the dump — pick one and it's saved to `foculet.json`.
+On first run Foculet walks you through a short setup: what it does, which
+monitor is the dump (plus board grid size), and the extension install with
+a connection test. Everything is saved to `foculet.json`. Re-run it anytime
+from the tray menu: **Setup…** — switching the dump monitor applies live.
 
 `.\ctl.ps1 -Action status` checks it's running; `-Action stop` kills it.
 
@@ -92,6 +92,7 @@ monitor is the dump — pick one and it's saved to `foculet.json`.
 | `dump_device` | Monitor that hosts the board (`\\.\DISPLAY2`…) | chosen at first run |
 | `grid_cols` / `grid_rows` | Board grid, 1–8 each; board capacity = cols × rows | 3 × 2 |
 | `excluded_exes` | Process names (e.g. `notepad.exe`) that are never parked | `[]` |
+| `never_park` | App names (e.g. `WhatsApp`) that are never parked | `[]` |
 
 Delete `foculet.json` to re-run first-time setup.
 
