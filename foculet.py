@@ -28,9 +28,6 @@ import threading
 import time
 import traceback
 import tkinter as tk
-import urllib.request
-import uuid
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from PIL import Image, ImageTk, ImageDraw
 
@@ -169,24 +166,14 @@ def safe_rect(hwnd):
         return None
 
 
-def find_extension_dir():
-    """Where the Foculet Chrome extension lives (shown by the setup wizard)."""
-    for base in (HERE, os.path.dirname(HERE)):
-        cand = os.path.join(base, "extension")
-        if os.path.isfile(os.path.join(cand, "manifest.json")):
-            return cand
-    return os.path.join(os.path.dirname(HERE), "extension")
-
-
 class _Onboarding:
-    """4-step setup wizard: welcome -> dump monitor -> Chrome extension ->
-    done. Runs on the Tk thread. Closing the window keeps the current
+    """3-step setup wizard: welcome -> dump monitor -> done.
+    Runs on the Tk thread. Closing the window keeps the current
     values (same contract as the old first-run picker)."""
 
     def __init__(self, monitors, cfg, master=None):
         self.monitors = monitors
         self.cfg = cfg
-        self.ext_dir = find_extension_dir()
         devices = {m["device"] for m in monitors}
         rightmost = max(monitors, key=lambda m: m["rect"][0])["device"]
         saved = cfg.get("dump_monitor")
@@ -213,7 +200,6 @@ class _Onboarding:
         self.body = body
         self._build_welcome()
         self._build_monitor()
-        self._build_extension()
         self._build_done()
         w.protocol("WM_DELETE_WINDOW", self._finish)
         self._show(0)
@@ -262,9 +248,7 @@ class _Onboarding:
                 f.pack(fill="both", expand=True)
             else:
                 f.pack_forget()
-        if i == 2:  # extension step: check the connection on entry
-            self._test_extension()
-        if i == 3:
+        if i == 2:
             self._done_summary.configure(
                 text=f"Dump monitor: {self._dump_var.get()}\n"
                      f"Board: {self._cols_var.get()} x {self._rows_var.get()} "
@@ -322,45 +306,6 @@ class _Onboarding:
                       "The monitor itself switches immediately.")
         self._nav(f, back=True, next_text="Next >")
 
-    def _build_extension(self):
-        f = self._frame()
-        self._title(f, "Install the Chrome extension")
-        self._body(f, "Foculet needs its Chrome extension to separate "
-                      "your tabs.")
-        for n, line in enumerate((
-                "Open chrome://extensions in Chrome.",
-                "Turn on Developer mode (top right).",
-                "Click \u201cLoad unpacked\u201d.",
-                "Select this folder:"), start=1):
-            self._body(f, f"{n}.  {line}")
-        prow = tk.Frame(f, bg="#1e1e1e")
-        prow.pack(fill="x", pady=(2, 4))
-        self._path_var = tk.StringVar(value=self.ext_dir)
-        tk.Entry(prow, textvariable=self._path_var, state="readonly",
-                 readonlybackground="#2a2a2a", fg="#dddddd", bd=0,
-                 font=("Segoe UI", 9)).pack(side="left", fill="x", expand=True,
-                                            ipady=4)
-        tk.Button(prow, text="Copy path", command=self._copy_path,
-                  bg="#2a2a2a", fg="#bbbbbb",
-                  activebackground="#3a3a3a", activeforeground="#ffffff",
-                  bd=0, padx=10, pady=3, cursor="hand2").pack(side="left",
-                                                              padx=(8, 0))
-        self._body(f, "The old \u201cMemyr Chrome Bridge\u201d (assistant / "
-                      "WhatsApp) is separate \u2014 leave it alone. This one "
-                      "talks only to Foculet, on its own local port.")
-        trow = tk.Frame(f, bg="#1e1e1e")
-        trow.pack(anchor="w", pady=(10, 0))
-        self._ext_test = tk.Button(
-            trow, text="Test connection", command=self._test_extension,
-            bg="#2a2a2a", fg="#bbbbbb",
-            activebackground="#3a3a3a", activeforeground="#ffffff",
-            bd=0, padx=12, pady=4, cursor="hand2")
-        self._ext_test.pack(side="left")
-        self._ext_status = tk.Label(trow, text="", bg="#1e1e1e",
-                                    fg="#bbbbbb", font=("Segoe UI", 10))
-        self._ext_status.pack(side="left", padx=(12, 0))
-        self._nav(f, back=True, next_text="Next >")
-
     def _build_done(self):
         f = self._frame()
         self._title(f, "You're set.")
@@ -372,45 +317,6 @@ class _Onboarding:
         self._nav(f, back=True, next_text="Finish", on_next=self._finish)
 
     # -- actions ---------------------------------------------------------
-
-    def _copy_path(self):
-        try:
-            self.win.clipboard_clear()
-            self.win.clipboard_append(self.ext_dir)
-        except Exception:
-            pass
-
-    def _test_extension(self):
-        try:
-            self._ext_status.configure(text="Pinging\u2026", fg="#bbbbbb")
-            self._ext_test.configure(state="disabled")
-        except Exception:
-            return
-        def _go():
-            try:
-                ok, data = bridge_cmd("ping", timeout=8)
-                good = bool(ok and data == "pong")
-            except Exception:
-                good = False
-            try:
-                self.win.after(0, lambda: self._ext_test_done(good))
-            except Exception:
-                pass
-        threading.Thread(target=_go, daemon=True).start()
-
-    def _ext_test_done(self, good):
-        try:
-            self._ext_test.configure(state="normal")
-            if good:
-                self._ext_status.configure(text="Connected \u2713",
-                                           fg="#7fbf7f")
-            else:
-                self._ext_status.configure(
-                    text="Not responding \u2014 finish the steps above, "
-                         "then test again.",
-                    fg="#d97a7a")
-        except Exception:
-            pass
 
     def _finish(self):
         try:
@@ -431,7 +337,7 @@ class _Onboarding:
 
 
 def onboarding_wizard(monitors, cfg, master=None):
-    """4-step setup wizard (welcome, dump monitor, Chrome extension, done).
+    """3-step setup wizard (welcome, dump monitor, done).
     Returns the updated cfg dict. Closing the window keeps the current
     values."""
     cfg.setdefault("grid_cols", GRID_COLS)
@@ -620,36 +526,10 @@ def place(hwnd, x, y, w, h):
 
 # ---------------------------------------------------------------- thumbnails
 
-def capture_thumbnail(hwnd, path, maxsize):
-    """Snap the window to a PNG thumbnail that fills a board cell.
-
-    Keeps the top ~62% of the window - title bar, tabs, toolbar, top of
-    the content: the part you actually recognize - then scales it to
-    cover maxsize, anchored top-left, so the picture fills its cell
-    with no empty bands.
-    Returns True on success."""
-    tmp = path + ".bmp"
+def _finish_thumb(tmp, path, maxsize):
+    """Shared PIL tail for both capture paths: keep the recognizable
+    top ~62%, scale to cover the cell anchored top-left, save the PNG."""
     try:
-        l, t, r, b = win32gui.GetWindowRect(hwnd)
-        w, h = r - l, b - t
-        if w <= 0 or h <= 0:
-            return False
-        hwnd_dc = win32gui.GetWindowDC(hwnd)
-        try:
-            mfc_dc = win32ui.CreateDCFromHandle(hwnd_dc)
-            save_dc = mfc_dc.CreateCompatibleDC()
-            try:
-                bmp = win32ui.CreateBitmap()
-                bmp.CreateCompatibleBitmap(mfc_dc, w, h)
-                save_dc.SelectObject(bmp)
-                if not print_window(hwnd, save_dc.GetSafeHdc()):
-                    return False
-                bmp.SaveBitmapFile(save_dc, tmp)
-            finally:
-                save_dc.DeleteDC()
-                mfc_dc.DeleteDC()
-        finally:
-            win32gui.ReleaseDC(hwnd, hwnd_dc)
         img = Image.open(tmp).convert("RGB")
         if img.getbbox() is None:
             return False  # captured nothing but black
@@ -675,6 +555,85 @@ def capture_thumbnail(hwnd, path, maxsize):
             pass
 
 
+def _bitblt_window(hwnd, tmp):
+    """Copy the window's on-screen pixels straight off the display.
+
+    ~10ms and the target app is never asked to render, so it never
+    blocks. Only valid while the window is fully visible (foreground);
+    anywhere else the pixels would be some other window's."""
+    l, t, r, b = win32gui.GetWindowRect(hwnd)
+    w, h = r - l, b - t
+    if w <= 0 or h <= 0:
+        return False
+    screen_dc = win32gui.GetDC(0)
+    try:
+        mfc_dc = win32ui.CreateDCFromHandle(screen_dc)
+        save_dc = mfc_dc.CreateCompatibleDC()
+        try:
+            bmp = win32ui.CreateBitmap()
+            bmp.CreateCompatibleBitmap(mfc_dc, w, h)
+            save_dc.SelectObject(bmp)
+            save_dc.BitBlt((0, 0), (w, h), mfc_dc, (l, t),
+                           win32con.SRCCOPY)
+            bmp.SaveBitmapFile(save_dc, tmp)
+            return True
+        finally:
+            save_dc.DeleteDC()
+            mfc_dc.DeleteDC()
+    finally:
+        win32gui.ReleaseDC(0, screen_dc)
+
+
+def capture_thumbnail(hwnd, path, maxsize, fast=False):
+    """Snap the window to a PNG thumbnail that fills a board cell.
+
+    Keeps the top ~62% of the window - title bar, tabs, toolbar, top of
+    the content: the part you actually recognize - then scales it to
+    cover maxsize, anchored top-left, so the picture fills its cell
+    with no empty bands.
+    fast=True takes the window straight off the screen (BitBlt): ~10ms
+    and the app is never involved, so it can't stutter - but it's only
+    correct while the window is the foreground (fully visible) window.
+    Otherwise the app is asked to render via PrintWindow.
+    Returns True on success."""
+    tmp = path + ".bmp"
+    try:
+        if fast:
+            if not _bitblt_window(hwnd, tmp):
+                return False
+        else:
+            l, t, r, b = win32gui.GetWindowRect(hwnd)
+            w, h = r - l, b - t
+            if w <= 0 or h <= 0:
+                return False
+            hwnd_dc = win32gui.GetWindowDC(hwnd)
+            try:
+                mfc_dc = win32ui.CreateDCFromHandle(hwnd_dc)
+                save_dc = mfc_dc.CreateCompatibleDC()
+                try:
+                    bmp = win32ui.CreateBitmap()
+                    bmp.CreateCompatibleBitmap(mfc_dc, w, h)
+                    save_dc.SelectObject(bmp)
+                    if not print_window(hwnd, save_dc.GetSafeHdc()):
+                        return False
+                    bmp.SaveBitmapFile(save_dc, tmp)
+                finally:
+                    save_dc.DeleteDC()
+                    mfc_dc.DeleteDC()
+            finally:
+                win32gui.ReleaseDC(hwnd, hwnd_dc)
+        return _finish_thumb(tmp, path, maxsize)
+    except Exception as e:
+        log(f"thumbnail failed: {e}")
+        return False
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+
+
 def make_placeholder_thumb(path, title, size=(296, 200)):
     """Fallback picture when a window refuses to be screenshotted."""
     try:
@@ -685,135 +644,6 @@ def make_placeholder_thumb(path, title, size=(296, 200)):
         img.save(path, "PNG")
     except Exception as e:
         log(f"placeholder failed: {e}")
-
-
-# ---------------------------------------------------------------- bridge
-
-FOCULET_BRIDGE_PORT = 18722  # Foculet's own localhost command queue for
-                             # the Foculet Bridge Chrome extension.
-                             # Independent of the Memyr bridge on 18721.
-BRIDGE_URL = "http://127.0.0.1:%d" % FOCULET_BRIDGE_PORT
-
-_bridge_queue = []    # [{id, action, args}]
-_bridge_results = {}  # id -> {ok, data, error}
-_bridge_lock = threading.Condition()
-
-
-class _BridgeHandler(BaseHTTPRequestHandler):
-    """Serves the Foculet Bridge extension: long-poll /poll for commands,
-    POST /cmd to enqueue, GET /result/<id>, POST /result to report back."""
-
-    def _json(self, obj, code=200):
-        body = json.dumps(obj).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def do_GET(self):
-        if self.path == "/poll":
-            # Long-poll up to 25s for the next command (keeps the
-            # extension's service worker responsive).
-            deadline = time.time() + 25
-            with _bridge_lock:
-                while True:
-                    if _bridge_queue:
-                        return self._json(_bridge_queue.pop(0))
-                    remaining = deadline - time.time()
-                    if remaining <= 0:
-                        return self._json({"wait": True})
-                    _bridge_lock.wait(timeout=min(remaining, 5))
-        elif self.path.startswith("/result/"):
-            cid = self.path[len("/result/"):]
-            with _bridge_lock:
-                if cid in _bridge_results:
-                    return self._json(_bridge_results.pop(cid))
-            return self._json({"pending": True})
-        elif self.path == "/health":
-            with _bridge_lock:
-                return self._json({"ok": True,
-                                   "queued": len(_bridge_queue)})
-        else:
-            self.send_error(404)
-
-    def do_POST(self):
-        length = int(self.headers.get("Content-Length", 0) or 0)
-        try:
-            body = json.loads(self.rfile.read(length) or b"{}")
-        except Exception:
-            body = {}
-        if self.path == "/cmd":
-            cid = uuid.uuid4().hex[:8]
-            with _bridge_lock:
-                _bridge_queue.append({
-                    "id": cid,
-                    "action": body.get("action"),
-                    "args": body.get("args") or {},
-                })
-                _bridge_lock.notify_all()
-            return self._json({"id": cid})
-        elif self.path == "/result":
-            cid = body.get("id")
-            if cid:
-                with _bridge_lock:
-                    _bridge_results[cid] = {
-                        "ok": body.get("ok", True),
-                        "data": body.get("data"),
-                        "error": body.get("error"),
-                    }
-                    _bridge_lock.notify_all()
-            return self._json({"stored": True})
-        else:
-            self.send_error(404)
-
-    def log_message(self, *args):
-        pass
-
-
-def start_bridge_server():
-    """Start Foculet's own Chrome command queue (localhost-only)."""
-    server = ThreadingHTTPServer(("127.0.0.1", FOCULET_BRIDGE_PORT),
-                                 _BridgeHandler)
-    server.daemon_threads = True
-    t = threading.Thread(target=server.serve_forever, daemon=True,
-                         name="foculet-bridge")
-    t.start()
-    return server
-
-
-def bridge_cmd(action, args=None, timeout=10):
-    """Send a command to the Foculet Bridge extension on this PC.
-
-    Returns (ok, data_or_error). Quietly reports unreachable/timeout -
-    the caller decides how loudly to complain."""
-    try:
-        body = json.dumps({"action": action, "args": args or {}}).encode()
-        req = urllib.request.Request(
-            BRIDGE_URL + "/cmd", data=body,
-            headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=5) as r:
-            cid = json.loads(r.read().decode()).get("id")
-        if not cid:
-            return False, "no command id"
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            try:
-                with urllib.request.urlopen(
-                        BRIDGE_URL + "/result/" + cid, timeout=5) as r:
-                    res = json.loads(r.read().decode())
-            except Exception:
-                time.sleep(0.5)
-                continue
-            if res.get("pending"):
-                time.sleep(0.5)
-                continue
-            if res.get("ok"):
-                return True, res.get("data")
-            return False, res.get("error")
-        return False, "extension did not respond"
-    except Exception as e:
-        return False, "bridge unreachable: %s" % (e,)
 
 
 class Foculet:
@@ -842,10 +672,11 @@ class Foculet:
         cell_h = (wb - wt - 24) // grid_rows - 12
         self.thumb_max = (max(240, cell_w - 8), max(160, cell_h - 48))
         self.lock = threading.Lock()
-        self._tab_op = threading.Event()  # set while a tab tear-off is in flight
         self._quiet_until = 0.0  # focus changes before this are ours
                                  # (minimize/restore); the watcher absorbs
                                  # them instead of treating them as switches
+        self._last_fg_cache = 0.0  # last refresh of the focused window's
+                                   # snapshot (backs every park)
         self._paused = threading.Event()  # set from the tray menu: parking
                                           # halts until resumed
         self._tray_hwnd = None  # tray message window (tray thread)
@@ -926,7 +757,10 @@ class Foculet:
     def _cache_thumb(self, hwnd):
         """Snapshot the newly focused window. If the user minimizes it
         later, the minimize hook fires too late to capture (the window is
-        already iconic) - this cache is the picture it parks with."""
+        already iconic) - this cache is the picture it parks with.
+        The foreground window is taken straight off the screen (BitBlt):
+        ~10ms and the app never blocks. Anything else falls back to
+        PrintWindow."""
         if not hwnd or hwnd in self.parked_keys():
             return
         try:
@@ -947,7 +781,16 @@ class Foculet:
                 except Exception:
                     pass
         path = os.path.join(THUMB_DIR, f"cache_{hwnd}_{seq}.png")
-        if capture_thumbnail(hwnd, path, self.thumb_max):
+        try:
+            is_fg = win32gui.GetForegroundWindow() == hwnd
+        except Exception:
+            is_fg = False
+        ok = capture_thumbnail(hwnd, path, self.thumb_max, fast=is_fg)
+        if not ok and is_fg:
+            # screen copy failed on a foreground window (odd) - fall
+            # back to asking the app to render
+            ok = capture_thumbnail(hwnd, path, self.thumb_max)
+        if ok:
             with self.lock:
                 prev = self._thumb_cache.pop(hwnd, None)
                 self._thumb_cache[hwnd] = path
@@ -961,6 +804,24 @@ class Foculet:
                 os.remove(path)
             except Exception:
                 pass
+
+    def _cache_thumb_later(self, hwnd):
+        """Refresh the focus-time snapshot off the critical path: let
+        the switch animation settle, then grab the foreground window
+        straight off the screen (~10ms, the app never blocks). If focus
+        already moved on, that switch's own call handles it."""
+        def _go():
+            time.sleep(0.25)
+            try:
+                if win32gui.GetForegroundWindow() != hwnd:
+                    return
+                if hwnd in self.parked_keys():
+                    return
+            except Exception:
+                return
+            self._cache_thumb(hwnd)
+        threading.Thread(target=_go, daemon=True,
+                         name="foculet-cache").start()
 
     def _drop_cache(self, hwnd):
         with self.lock:
@@ -1616,17 +1477,29 @@ class Foculet:
             self.sweep_dead()
 
             if fg != prev:
-                # a switch happened: prev -> fg. while a tab tear-off is
-                # in flight the tab thread owns focus changes; just track.
-                # right after our own minimize/restore, absorb the focus
-                # echo instead of reading it as another switch (that echo
-                # is what used to cascade: park -> focus jump -> park...)
+                # a switch happened: prev -> fg. right after our own
+                # minimize/restore, absorb the focus echo instead of
+                # reading it as another switch (that echo is what used
+                # to cascade: park -> focus jump -> park...)
                 with self.lock:
                     quiet = time.time() < self._quiet_until
                 paused = self._paused.is_set()
-                if not self._tab_op.is_set() and not quiet and not paused:
+                if not quiet and not paused:
                     self.on_fg_change(fg)
                 prev = fg
+                with self.lock:
+                    self._last_fg_cache = time.time()
+            elif fg and not self._paused.is_set():
+                # no switch: the focused window's snapshot backs every
+                # later park(), so refresh it while it's cheap (the
+                # foreground BitBlt path) instead of re-capturing at
+                # switch time
+                with self.lock:
+                    due = time.time() - self._last_fg_cache > 30
+                    if due:
+                        self._last_fg_cache = time.time()
+                if due:
+                    self._cache_thumb(fg)
 
     def on_fg_change(self, fg):
         # each screen remembers its current window; the moment you
@@ -1663,15 +1536,22 @@ class Foculet:
                     and prev_current not in self.parked_keys()
                     and parkable(prev_current, self.dump["device"],
                                  self.excluded, self.never_park)):
-                self.park(prev_current)  # park() enforces the board cap
+                # the snapshot taken when this window was focused is the
+                # picture: re-capturing here would make the app being
+                # left behind re-render for no visible gain
+                with self.lock:
+                    thumb_src = self._thumb_cache.get(prev_current)
+                # park() enforces the board cap
+                self.park(prev_current, thumb_src=thumb_src)
             if fg != OWN_CONSOLE:
                 with self.lock:
                     self.current[dev] = fg
         # keep a fresh snapshot of the newly focused window: if the user
         # minimizes it later, the minimize hook fires too late to capture
         # (the window is already iconic) - the cache is the picture.
-        if fg and not self._paused.is_set() and not self._tab_op.is_set():
-            self._cache_thumb(fg)
+        # off the critical path, so the switch itself never stutters.
+        if fg and not self._paused.is_set():
+            self._cache_thumb_later(fg)
 
     # -- minimize parking (its own thread with a message pump) ---------
 
@@ -1720,8 +1600,6 @@ class Foculet:
                     or time.time() < self._quiet_until):
                 return
             thumb_src = self._thumb_cache.get(hwnd)
-        if self._tab_op.is_set():
-            return  # a tab tear-off is in flight; it owns focus right now
         if hwnd == getattr(self, "_tray_hwnd", None):
             return
         try:
@@ -1749,165 +1627,6 @@ class Foculet:
         log(f"minimized by user - parking '{safe_title(hwnd)}'")
         self.park(hwnd, thumb_src=thumb_src)
 
-    # -- chrome tab parking (runs on a background thread) -------------
-
-    def is_chrome_window(self, hwnd):
-        buf = ctypes.create_unicode_buffer(64)
-        try:
-            if not ctypes.windll.user32.GetClassNameW(hwnd, buf, 64):
-                return False
-        except Exception:
-            return False
-        return buf.value == "Chrome_WidgetWin_1"
-
-    def chrome_hwnds(self):
-        """Set of visible top-level Chrome window handles right now."""
-        out = set()
-
-        def cb(hwnd, _):
-            try:
-                if win32gui.IsWindowVisible(hwnd) \
-                        and self.is_chrome_window(hwnd):
-                    out.add(hwnd)
-            except Exception:
-                pass
-            return True
-
-        try:
-            win32gui.EnumWindows(cb, None)
-        except Exception:
-            pass
-        return out
-
-    def _chrome_hwnd_for(self, fwin):
-        """Find the OS window handle of a Chrome window by its rect."""
-        want = (fwin.get("left") or 0, fwin.get("top") or 0,
-                (fwin.get("left") or 0) + (fwin.get("width") or 0),
-                (fwin.get("top") or 0) + (fwin.get("height") or 0))
-        for hwnd in self.chrome_hwnds():
-            try:
-                r = win32gui.GetWindowRect(hwnd)
-            except Exception:
-                continue
-            if all(abs(a - b) <= 8 for a, b in zip(r, want)):
-                return hwnd
-        return None
-
-    def tab_watcher(self):
-        """Poll Chrome for tab switches in the focused window.
-
-        When Daniel switches tabs, the tab he just left is torn off into
-        its own window and parked on the dump board like any other window.
-        """
-        last_active = {}  # chrome windowId -> active tabId
-        warned = False
-        while True:
-            time.sleep(1.0)
-            try:
-                ok, state = bridge_cmd("chrome_state", timeout=12)
-            except Exception as e:
-                ok, state = False, str(e)
-            if not ok:
-                if not warned:
-                    log(f"chrome bridge unavailable ({state}); "
-                        f"tab parking paused")
-                    warned = True
-                time.sleep(4.0)
-                continue
-            warned = False
-            wins = {w["id"]: w for w in state.get("windows", [])}
-            for wid in list(last_active):
-                if wid not in wins:
-                    del last_active[wid]
-            fwin = next((w for w in wins.values() if w.get("focused")), None)
-            if not fwin:
-                continue
-            wid = fwin["id"]
-            tabs = [t for t in state.get("tabs", [])
-                    if t.get("windowId") == wid]
-            active = next((t for t in tabs if t.get("active")), None)
-            if not active:
-                continue
-            tid = active["id"]
-            prev = last_active.get(wid)
-            if prev is None or prev == tid \
-                    or not any(t["id"] == prev for t in tabs):
-                last_active[wid] = tid
-            elif self._paused.is_set():
-                # paused from the tray: track the tab so resume doesn't
-                # tear off a stale one, but don't park anything
-                last_active[wid] = tid
-            elif self.tear_off_tab(fwin, prev):
-                last_active[wid] = tid
-            # else: detach failed; keep prev so the next poll retries it
-
-    def tear_off_tab(self, fwin, old_tab):
-        """Tear old_tab off into its own window and park it.
-
-        Returns True when the tab is handled (parked, or deliberately left
-        alone) and False when the detach failed.
-        """
-        # never tear off tabs from a Chrome window on the dump monitor
-        cx = (fwin.get("left") or 0) + (fwin.get("width") or 0) // 2
-        cy = (fwin.get("top") or 0) + (fwin.get("height") or 0) // 2
-        mon = monitor_from_rect((cx, cy, cx + 1, cy + 1))
-        if mon and mon["device"] == self.dump["device"]:
-            return True
-        self._tab_op.set()
-        try:
-            before = self.chrome_hwnds()
-            ok, data = bridge_cmd("detach_tab", {"tabId": old_tab},
-                                  timeout=30)
-            if not ok:
-                log(f"chrome detach failed ({data}); will retry")
-                return False
-            new_wid = (data or {}).get("windowId")
-            # the torn-off window is brand new: find it by diffing the
-            # visible Chrome windows instead of racing the foreground
-            new_hwnd = None
-            deadline = time.time() + 5.0
-            while time.time() < deadline and new_hwnd is None:
-                diff = self.chrome_hwnds() - before
-                if len(diff) == 1:
-                    new_hwnd = diff.pop()
-                elif diff:
-                    fg = win32gui.GetForegroundWindow()
-                    if fg in diff:
-                        new_hwnd = fg
-                        break
-                time.sleep(0.25)
-            if new_hwnd is None:
-                # lone-tab window (detach was a no-op) or a missed diff:
-                # match the Chrome window by its rectangle instead
-                new_hwnd = self._chrome_hwnd_for(fwin)
-            # confirm the detach really happened: our tab alone in the
-            # returned window, and that window focused
-            verified = False
-            ok2, state = bridge_cmd("chrome_state", timeout=12)
-            if ok2 and new_wid:
-                wins = {w["id"]: w for w in state.get("windows", [])}
-                winfo = wins.get(new_wid)
-                wtabs = [t["id"] for t in state.get("tabs", [])
-                         if t.get("windowId") == new_wid]
-                verified = bool(winfo and winfo.get("focused")
-                                and wtabs == [old_tab])
-            if not verified:
-                log("chrome detach: not verified, leaving window alone")
-                return True
-            if new_hwnd and parkable(new_hwnd, self.dump["device"],
-                                     self.excluded, self.never_park):
-                log(f"tab torn off -> '{safe_title(new_hwnd)}'")
-                self.park(new_hwnd)
-            else:
-                log(f"chrome detach: torn-off window not parkable "
-                    f"(hwnd={new_hwnd})")
-            return True
-        except Exception as e:
-            log(f"tear_off_tab failed: {e}")
-            return False
-        finally:
-            self._tab_op.clear()
-
     def _tk_crash(self, exc, val, tb):
         try:
             with open(CRASH_PATH, "a", encoding="utf-8") as f:
@@ -1922,19 +1641,10 @@ class Foculet:
     def run(self):
         self.build_lot()
         self.root.report_callback_exception = self._tk_crash
-        try:
-            start_bridge_server()  # Foculet's own Chrome command queue
-            log(f"bridge server listening on 127.0.0.1:{FOCULET_BRIDGE_PORT}")
-        except OSError as e:
-            log(f"WARNING: could not start bridge server: {e} "
-                f"(a stale Foculet may still be running?)")
         self.start_tray()  # needs root (for the title); runs its own thread
         t = threading.Thread(target=self.watcher, daemon=True,
                              name="foculet-watcher")
         t.start()
-        c = threading.Thread(target=self.tab_watcher, daemon=True,
-                             name="foculet-tabs")
-        c.start()
         m = threading.Thread(target=self._minimize_hook_main, daemon=True,
                              name="foculet-minimize")
         m.start()
@@ -1983,8 +1693,8 @@ def main():
     grid_rows = cfg.get("grid_rows", GRID_ROWS)
     fresh_setup = False
     if not dump:
-        # first run: the setup wizard (welcome, dump monitor, Chrome
-        # extension, done), then remember the choices
+        # first run: the setup wizard (welcome, dump monitor, done),
+        # then remember the choices
         cfg = onboarding_wizard(list_monitors(), cfg)
         save_config(args.config, cfg)
         dump = cfg.get("dump_monitor")
