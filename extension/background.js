@@ -1,19 +1,20 @@
-// Foculet Bridge — MV3 service worker.
-//
-// Long-polls the local Foculet bridge server (http://127.0.0.1:18721)
-// for commands and executes the Chrome-side half of Foculet's tab
-// parking: reporting window/tab state, tearing a tab off into its own
-// window, and closing tabs. Nothing leaves the machine.
+// Foculet Bridge — service worker.
+// Polls the local bridge server for commands and runs Foculet's tab
+// actions: ping, chrome_state, detach_tab.
+// (Assistant/WhatsApp actions live in the separate Memyr Chrome Bridge.)
 
-const BASE = "http://127.0.0.1:18721";
+const BASE = "http://127.0.0.1:18722";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let polling = false;
 
 async function run(cmd) {
   const a = cmd.args || {};
   switch (cmd.action) {
+    case "ping":
+      return { data: "pong" };
+
     case "chrome_state": {
-      // one-shot windows + tabs state for Foculet's tab watcher
+      // Foculet tab watcher: one-shot windows + tabs state.
       const wins = await chrome.windows.getAll();
       const alltabs = await chrome.tabs.query({});
       return {
@@ -31,8 +32,8 @@ async function run(cmd) {
     }
 
     case "detach_tab": {
-      // args: {tabId} — tears the tab into its own new window, state preserved.
-      // Idempotent: if the tab is already alone in its window, returns it.
+      // args: {tabId} -- tears the tab into its own new window, state preserved.
+      // Idempotent: if the tab is already alone in its window, return it.
       const t = await chrome.tabs.get(a.tabId);
       const cur = await chrome.windows.get(t.windowId, { populate: true });
       if (cur.tabs.length === 1) {
@@ -40,17 +41,6 @@ async function run(cmd) {
       }
       const w = await chrome.windows.create({ tabId: a.tabId });
       return { data: { windowId: w.id, tabId: a.tabId } };
-    }
-
-    case "close_tabs": {
-      // args: {tabIds} — tolerant: already-closed tabs are just skipped
-      const ids = a.tabIds || [];
-      const existing = [];
-      for (const id of ids) {
-        try { await chrome.tabs.get(id); existing.push(id); } catch (e) {}
-      }
-      if (existing.length) await chrome.tabs.remove(existing);
-      return { data: { closed: existing.length } };
     }
 
     default:
@@ -93,7 +83,6 @@ async function poll() {
   }
 }
 
-// MV3 service workers die when idle; the alarm keeps this one responsive.
 chrome.alarms.onAlarm.addListener(() => poll());
 chrome.runtime.onStartup.addListener(() => poll());
 chrome.runtime.onInstalled.addListener(() => {
